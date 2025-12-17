@@ -249,7 +249,24 @@ bool getEnvUseTileSizeKv64ForTrtllmGen()
 bool getEnvEnablePDL()
 {
     static std::once_flag flag;
-    static bool enablePDL = true;
+    static bool enableOtherKernelsPDL = false;
+
+    std::call_once(flag,
+        [&]()
+        {
+            if (getSMVersion() >= 90)
+            {
+                // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
+                enableOtherKernelsPDL = getBoolEnv("TRTLLM_ENABLE_OTHER_KERNELS_PDL");
+            }
+        });
+    return enableOtherKernelsPDL;
+}
+
+bool getEnvEnablePDL_()
+{
+    static std::once_flag flag;
+    static bool enablePDL = false;
 
     std::call_once(flag,
         [&]()
@@ -281,6 +298,105 @@ bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
 
     std::call_once(flag, [&]() { enabled = getBoolEnv("TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL"); });
     return enabled;
+}
+
+bool getEnvDisableQuantizePDL()
+{
+    static std::once_flag flag;
+    static bool disableQuantizePDL = false;
+
+    std::call_once(flag,
+        [&]()
+        {
+            if (getSMVersion() >= 90)
+            {
+                disableQuantizePDL = getBoolEnv("TRTLLM_DISABLE_QUANTIZE_PDL");
+            }
+        });
+    return disableQuantizePDL;
+}
+
+bool getEnvDisableBmmPDL()
+{
+    static std::once_flag flag;
+    static bool disableBmmPDL = false;
+
+    std::call_once(flag,
+        [&]()
+        {
+            if (getSMVersion() >= 90)
+            {
+                disableBmmPDL = getBoolEnv("TRTLLM_DISABLE_BMM_PDL");
+            }
+        });
+    return disableBmmPDL;
+}
+
+bool getEnvDisableMhaPDL()
+{
+    static std::once_flag flag;
+    static bool disableMhaPDL = false;
+
+    std::call_once(flag,
+        [&]()
+        {
+            if (getSMVersion() >= 90)
+            {
+                disableMhaPDL = getBoolEnv("TRTLLM_DISABLE_MHA_PDL");
+            }
+        });
+    return disableMhaPDL;
+}
+
+// applyBiasRopeUpdateKVCacheV2
+bool getEnvDisableBiaRopePDL()
+{
+    static std::once_flag flag;
+    static bool disableBiaRopePDL = false;
+
+    std::call_once(flag,
+        [&]()
+        {
+            if (getSMVersion() >= 90)
+            {
+                disableBiaRopePDL = getBoolEnv("TRTLLM_DISABLE_BIAS_ROPE_PDL");
+            }
+        });
+    return disableBiaRopePDL;
+}
+
+// void moe::dev::finalize::finalizeKernel<moe::dev::finalize::KernelParams
+bool getEnvDisableMOEFinalizePDL()
+{
+    static std::once_flag flag;
+    static bool disableMOEFinalizePDL = false;
+
+    std::call_once(flag,
+        [&]()
+        {
+            if (getSMVersion() >= 90)
+            {
+                disableMOEFinalizePDL = getBoolEnv("TRTLLM_DISABLE_MOE_FINALIZE_PDL");
+            }
+        });
+    return disableMOEFinalizePDL;
+}
+
+// void moe::dev::finalize::finalizeKernel<moe::dev::finalize::KernelParams
+bool getEnvDisableTRTLLMGenGemmPDL()
+{
+    static std::once_flag flag;
+    static bool disableTRTLLMGenGemmPDL = false;
+
+    std::call_once(flag,
+        [&]()
+        {
+            if (getSMVersion() >= 90)
+            {
+                disableTRTLLMGenGemmPDL = getBoolEnv("TRTLLM_DISABLE_TRTLLM_GEN_GEMM_PDL");
+            }
+        });
+    return disableTRTLLMGenGemmPDL;
 }
 
 bool getEnvUseUCXKvCache()
