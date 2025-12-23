@@ -260,6 +260,22 @@ bool getEnvEnablePDL()
     return enablePDL;
 }
 
+bool getEnvDisableQuantizePDL()
+{
+    static std::once_flag flag;
+    static bool disableQuantizePDL = false;
+
+    std::call_once(flag,
+        [&]()
+        {
+            if (getSMVersion() >= 90)
+            {
+                disableQuantizePDL = getBoolEnv("TRTLLM_DISABLE_QUANTIZE_PDL");
+            }
+        });
+    return disableQuantizePDL;
+}
+
 bool getEnvUseUCXKvCache()
 {
     static bool const useUCXKVCache = getBoolEnv("TRTLLM_USE_UCX_KVCACHE");

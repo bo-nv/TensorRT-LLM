@@ -57,6 +57,8 @@ int getEnvMmhaKernelBlockSize();
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
 
+bool getEnvDisableQuantizePDL();
+
 template <typename KernelFn, typename... Args>
 inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
     cudaStream_t stream, Args&&... args)
