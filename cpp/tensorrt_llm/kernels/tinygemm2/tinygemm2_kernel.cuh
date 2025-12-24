@@ -236,7 +236,6 @@ __global__ __launch_bounds__(384, 1) void kernel(__nv_bfloat16* output, __nv_bfl
         if (!weight_warp)
         {
             cudaGridDependencySynchronize();
-            cudaTriggerProgrammaticLaunchCompletion();
         }
 
         for (int ki = 0; ki < K_LOOPS_DMA; ki++)
@@ -443,5 +442,6 @@ __global__ __launch_bounds__(384, 1) void kernel(__nv_bfloat16* output, __nv_bfl
                 profile[blockIdx.x].complete = gclock64();
         }
     }
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif // end if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
 }
