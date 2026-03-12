@@ -41,6 +41,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -73,6 +74,7 @@ class RecvReqInfo:
     unique_rid: int
     start_token_idx: Optional[int] = None
     aux_slot: Optional[int] = None
+    mamba_state_index: Optional[int] = None
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(asdict(self))
@@ -517,6 +519,20 @@ class Sender(SenderBase):
                     dst_frags.extend(rp.dst.memory.ptrs)  # type: ignore[attr-defined]
                     frag_size = rp.src.memory.bytes_per_region  # type: ignore[attr-defined]
                     kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))  # type: ignore[attr-defined]
+
+        # handle mamba fragments
+        m_src, m_dst, m_sizes = MambaPolicy.collect_frags(
+            self_page_table=extractor.page_table,
+            peer_page_table=peer_extractor.page_table,
+            src_slot=self._slice.mamba_state_index,
+            dst_slot=req_info.mamba_state_index,
+            self_ri=self._registrar.self_rank_info,
+            peer_ri=peer_ri,
+        )
+        if m_src:
+            src_frags.extend(m_src)
+            dst_frags.extend(m_dst)
+            kv_sizes.extend(m_sizes)
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -1519,12 +1535,21 @@ class TransferWorker:
         pool_counter = 0
 
         for lg_idx, lg in enumerate(page_table.layer_groups):
-            for pv in lg.pool_views:
-                pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
-                pool_key = (pool.base_address, get_pool_bytes(pool))
-                if pool_key not in unique_pools:
-                    unique_pools[pool_key] = pool_counter
-                    pool_counter += 1
+            if lg.mamba_layer_offsets is not None:
+                num_mamba_layers = len(lg.mamba_layer_offsets)
+                for pool in [lg.conv_states, lg.ssm_states]:
+                    pool_size = num_mamba_layers * pool.num_slots * pool.slot_bytes
+                    pool_key = (pool.base_address, pool_size)
+                    if pool_key not in unique_pools:
+                        unique_pools[pool_key] = pool_counter
+                        pool_counter += 1
+            else:
+                for pv in lg.pool_views:
+                    pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
+                    pool_key = (pool.base_address, get_pool_bytes(pool))
+                    if pool_key not in unique_pools:
+                        unique_pools[pool_key] = pool_counter
+                        pool_counter += 1
 
         for (pool_ptr, pool_size), idx in unique_pools.items():
             memory_desc = (

@@ -14,6 +14,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_i
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
@@ -108,6 +109,8 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         )
         ctx_server_endpoint = self.transfer_worker.sender_endpoint
         layer_num = len(self.kv_cache_manager.pp_layers)
+        if isinstance(self.kv_cache_manager, MambaHybridCacheManager):
+            layer_num += len(self.kv_cache_manager._impl.mamba_layer_offsets)
 
         ctx_server_endpoints = self.dist.allgather(ctx_server_endpoint)
         layer_num_per_pp = self.dist.pp_allgather(layer_num)
@@ -137,6 +140,10 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         tokens_per_block = self.kv_cache_manager.tokens_per_block
 
         for group_idx, lg in enumerate(self.page_table.layer_groups):
+            if lg.mamba_layer_offsets is not None:
+                # Mamba layer groups have no KV cache blocks; skip.
+                block_ids_per_layer_groups.append([])
+                continue
             if self.is_v2_manager:
                 # V2: Use get_aggregated_page_indices for efficient slot indices
                 group_id = group_idx
@@ -171,8 +178,15 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
                     block_ids = block_ids[-expected_valid:]
 
             block_ids_per_layer_groups.append(list(block_ids))
+        mamba_state_index = None
+        if isinstance(self.kv_cache_manager, MambaHybridCacheManager):
+            mamba_state_index = self.kv_cache_manager.mamba_cache_index[req.py_request_id]
 
-        return KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_layer_groups)
+        return KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=block_ids_per_layer_groups,
+            mamba_state_index=mamba_state_index,
+        )
 
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:

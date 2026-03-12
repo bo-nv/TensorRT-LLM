@@ -218,8 +218,13 @@ class PythonMambaCacheManager(BaseResourceManager):
         assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
 
         # partition conv_dim and nheads
+        d_inner_local = d_inner // tp_size
+        ng_ds_local = n_groups * d_state // tp_size
         conv_dim = conv_dim // tp_size
         nheads = nheads // tp_size
+
+        # Per-section dims for conv_state: [x | B | C]
+        self.conv_section_dims = [d_inner_local, ng_ds_local, ng_ds_local]
 
         # conv and ssm states device
         device = torch.device("cuda")
@@ -388,16 +393,50 @@ class PythonMambaCacheManager(BaseResourceManager):
         request_ids = context_ids + generation_ids
         self._prepare_mamba_cache_blocks(request_ids)
 
+    def add_dummy_requests(self, request_ids: List[int], **kwargs):
+        from .cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+        request_ids = [
+            rid for rid in request_ids if rid != CUDA_GRAPH_DUMMY_REQUEST_ID
+        ]
+        if request_ids:
+            self._prepare_mamba_cache_blocks(request_ids)
+
     def free_resources(self, request: LlmRequest):
         request_id = request.py_request_id
         if request_id in self.mamba_cache_index:
             block = self.mamba_cache_index.pop(request_id)
             self.mamba_cache_free_blocks.append(block)
 
-    def get_state_indices(self,
-                          request_ids: List[int] = None,
-                          is_padding: List[bool] = None) -> torch.Tensor:
-        return self.state_indices
+    def get_state_indices(
+            self,
+            request_ids: List[int] = None,
+            is_padding: List[bool] = None) -> torch.Tensor | List[int]:
+        if request_ids is None or is_padding is None:
+            return self.state_indices
+
+        assert len(request_ids) == len(is_padding), (
+            "request_ids and is_padding must have the same size")
+
+        used_slots = {
+            self.mamba_cache_index[req_id]
+            for req_id, pad in zip(request_ids, is_padding) if not pad
+        }
+        available_slots = iter(
+            sorted(set(range(self.state_indices.numel())) - used_slots))
+
+        def slot_for(req_id: int, pad: bool):
+            if pad:
+                try:
+                    return next(available_slots)
+                except StopIteration:
+                    raise AssertionError(
+                        "Run out of available slots for padding") from None
+            return self.mamba_cache_index[req_id]
+
+        result = [
+            slot_for(rid, pad) for rid, pad in zip(request_ids, is_padding)
+        ]
+        return result
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         layer_offset = self.mamba_layer_offsets[layer_idx]
@@ -553,8 +592,7 @@ class MambaCacheManager(BaseResourceManager):
         self._impl.free_resources(request)
 
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
-        if self._use_cpp:
-            self._impl.add_dummy_requests(request_ids, **kwargs)
+        self._impl.add_dummy_requests(request_ids, **kwargs)
 
     def get_state_indices(
         self,
