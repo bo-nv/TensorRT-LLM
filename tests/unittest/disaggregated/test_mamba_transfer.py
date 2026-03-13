@@ -387,12 +387,12 @@ def run_mamba_transfer_test(ctx_tp: int, gen_tp: int):
 
     # -- 4. Allocate slots --
     ctx_batch = ScheduledRequests()
-    ctx_batch.context_requests = ctx_reqs
+    ctx_batch.reset_context_requests(ctx_reqs)
     for mgr in ctx_mgrs:
         mgr.prepare_resources(ctx_batch)
 
     gen_batch = ScheduledRequests()
-    gen_batch.context_requests = gen_reqs
+    gen_batch.reset_context_requests(gen_reqs)
     for mgr in gen_mgrs:
         mgr.prepare_resources(gen_batch)
 
