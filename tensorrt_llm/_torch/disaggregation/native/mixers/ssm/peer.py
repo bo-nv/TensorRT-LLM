@@ -313,7 +313,7 @@ class MambaPolicy:
 
     @staticmethod
     def _build_layer_ptrs(
-        pool,
+        pool : PhysicalPool,
         layer_offsets: Dict[int,int],
         overlapping_layers: List[int],
         slot: int,
