@@ -314,7 +314,7 @@ class MambaPolicy:
     @staticmethod
     def _build_layer_ptrs(
         pool,
-        layer_offsets: dict,
+        layer_offsets: Dict[int,int],
         overlapping_layers: List[int],
         slot: int,
     ) -> List[int]:
