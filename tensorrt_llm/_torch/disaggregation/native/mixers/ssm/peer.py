@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from tensorrt_llm._torch.disaggregation.base.region import (
     MemRegionGroup,
@@ -7,7 +7,11 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegionPair,
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable, LayerGroup
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    KVCachePageTable,
+    LayerGroup,
+    PhysicalPool,
+)
 
 
 class MambaHeadMatchMapper(RegionMapperBase):
@@ -313,8 +317,8 @@ class MambaPolicy:
 
     @staticmethod
     def _build_layer_ptrs(
-        pool : PhysicalPool,
-        layer_offsets: Dict[int,int],
+        pool: PhysicalPool,
+        layer_offsets: Dict[int, int],
         overlapping_layers: List[int],
         slot: int,
     ) -> List[int]:
