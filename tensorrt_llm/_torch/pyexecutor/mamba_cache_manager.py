@@ -399,7 +399,12 @@ class PythonMambaCacheManager(BaseResourceManager):
             rid for rid in request_ids if rid != CUDA_GRAPH_DUMMY_REQUEST_ID
         ]
         if request_ids:
-            self._prepare_mamba_cache_blocks(request_ids)
+            for r in request_ids:
+                if r not in self.mamba_cache_index:
+                    if len(self.mamba_cache_free_blocks) == 0:
+                        raise Exception("run out of mamba cache blocks")
+                    block = self.mamba_cache_free_blocks.pop()
+                    self.mamba_cache_index[r] = block
 
     def free_resources(self, request: LlmRequest):
         request_id = request.py_request_id

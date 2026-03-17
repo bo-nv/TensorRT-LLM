@@ -14,7 +14,10 @@ from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_i
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MambaHybridCacheManager,
+    PythonMambaCacheManager,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
@@ -110,6 +113,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         ctx_server_endpoint = self.transfer_worker.sender_endpoint
         layer_num = len(self.kv_cache_manager.pp_layers)
         if isinstance(self.kv_cache_manager, MambaHybridCacheManager):
+            assert isinstance(self.kv_cache_manager._impl, PythonMambaCacheManager), (
+                "CppMambaCacheManager is not supported with Python transceiver, please set TRTLLM_USE_CPP_MAMBA=0"
+            )
             layer_num += len(self.kv_cache_manager._impl.mamba_layer_offsets)
 
         ctx_server_endpoints = self.dist.allgather(ctx_server_endpoint)

@@ -19,7 +19,10 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PoolView,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MambaHybridCacheManager,
+    PythonMambaCacheManager,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 from tensorrt_llm.bindings import DataType
@@ -85,6 +88,10 @@ class KVRegionExtractorV1(RegionExtractorBase):
 def _build_layer_group_for_mamba(
     manager: MambaHybridCacheManager, pool_group_idx: int
 ) -> LayerGroup:
+    assert isinstance(manager._impl, PythonMambaCacheManager), (
+        "CppMambaCacheManager is not supported with Python transceiver, please set TRTLLM_USE_CPP_MAMBA=0"
+    )
+
     mamba_layer_offsets = {
         int(global_layer_id): int(local_layer_id)
         for global_layer_id, local_layer_id in manager._impl.mamba_layer_offsets.items()
