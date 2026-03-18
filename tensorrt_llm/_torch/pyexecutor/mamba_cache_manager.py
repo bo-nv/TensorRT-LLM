@@ -341,7 +341,7 @@ class PythonMambaCacheManager(BaseResourceManager):
             # cache miss
             else:
                 if len(self.mamba_cache_free_blocks) == 0:
-                    raise Exception("run out of mamba cache blocks")
+                    raise RuntimeError("run out of mamba cache blocks")
                 block = self.mamba_cache_free_blocks.pop()
                 self.mamba_cache_index[r] = block
                 self.state_indices_list.append(block)
@@ -350,38 +350,6 @@ class PythonMambaCacheManager(BaseResourceManager):
                          dtype=torch.int32,
                          pin_memory=prefer_pinned()),
             non_blocking=True)
-
-    # When there exists padded requests, the state indices should not be repeated.
-    def reorder_state_indices_when_padding_requests(self, request_size,
-                                                    padding_size):
-        if padding_size == 0:
-            return
-
-        assert request_size + padding_size <= self.state_indices.numel(
-        ), "Padding requests run out of available mamba cache blocks"
-        # we can use mamba_cache_free_blocks for padding_requests
-        if padding_size <= len(self.mamba_cache_free_blocks):
-            self.state_indices[request_size:request_size +
-                               padding_size] = torch.tensor(
-                                   self.mamba_cache_free_blocks[:padding_size],
-                                   dtype=self.state_indices.dtype,
-                                   pin_memory=prefer_pinned()).to(
-                                       self.state_indices.device,
-                                       non_blocking=True)
-        # But just finished requests won't free their used resources immediately
-        # In explicit, the running order is self.scheduler.schedule_request, self._forward_step() and self._process_previous_batch() in the PyExecutor.
-        # In this way, the current forward step will remove finished requests but will not remove mamba_cache immediately.
-        else:
-            all_mamba_cache_indices = set(range(self.state_indices.numel()))
-            allocated_indices = set(self.state_indices_list)
-            free_indices = list(all_mamba_cache_indices - allocated_indices)
-            self.state_indices[request_size:request_size +
-                               padding_size] = torch.tensor(
-                                   free_indices[:padding_size],
-                                   dtype=self.state_indices.dtype,
-                                   pin_memory=prefer_pinned()).to(
-                                       self.state_indices.device,
-                                       non_blocking=True)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
@@ -402,7 +370,7 @@ class PythonMambaCacheManager(BaseResourceManager):
             for r in request_ids:
                 if r not in self.mamba_cache_index:
                     if len(self.mamba_cache_free_blocks) == 0:
-                        raise Exception("run out of mamba cache blocks")
+                        raise RuntimeError("run out of mamba cache blocks")
                     block = self.mamba_cache_free_blocks.pop()
                     self.mamba_cache_index[r] = block
 
@@ -412,13 +380,8 @@ class PythonMambaCacheManager(BaseResourceManager):
             block = self.mamba_cache_index.pop(request_id)
             self.mamba_cache_free_blocks.append(block)
 
-    def get_state_indices(
-            self,
-            request_ids: List[int] = None,
-            is_padding: List[bool] = None) -> torch.Tensor | List[int]:
-        if request_ids is None or is_padding is None:
-            return self.state_indices
-
+    def get_state_indices(self, request_ids: List[int],
+                          is_padding: List[bool]) -> List[int]:
         assert len(request_ids) == len(is_padding), (
             "request_ids and is_padding must have the same size")
 
@@ -605,12 +568,6 @@ class MambaCacheManager(BaseResourceManager):
         is_padding: Optional[List[bool]] = None
     ) -> Union[torch.Tensor, List[int]]:
         return self._impl.get_state_indices(request_ids, is_padding)
-
-    def reorder_state_indices_when_padding_requests(self, request_size: int,
-                                                    padding_size: int):
-        assert not self._use_cpp, "reorder_state_indices_when_padding_requests is not supported in CppMambaCacheManager"
-        self._impl.reorder_state_indices_when_padding_requests(
-            request_size, padding_size)
 
     @property
     def mamba_cache_free_blocks(self) -> List[int]:
