@@ -397,7 +397,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 try:
                     return next(available_slots)
                 except StopIteration:
-                    raise AssertionError(
+                    raise RuntimeError(
                         "Run out of available slots for padding") from None
             return self.mamba_cache_index[req_id]
 
