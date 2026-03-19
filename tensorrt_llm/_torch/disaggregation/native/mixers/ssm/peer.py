@@ -9,7 +9,7 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.page import (
     KVCachePageTable,
-    LayerGroup,
+    MambaLayerGroup,
     PhysicalPool,
 )
 
@@ -337,8 +337,8 @@ class MambaPolicy:
         is_conv: bool,
         tp_match: bool,
         transfer_layers: int,
-        self_mlg: LayerGroup,
-        peer_mlg: LayerGroup,
+        self_mlg: MambaLayerGroup,
+        peer_mlg: MambaLayerGroup,
         self_pool: PhysicalPool,
         peer_pool: PhysicalPool,
         self_mamba_tp: int,
@@ -384,8 +384,8 @@ class MambaPolicy:
 
     @staticmethod
     def build_mamba_frags(
-        self_mlg: LayerGroup,
-        peer_mlg: LayerGroup,
+        self_mlg: MambaLayerGroup,
+        peer_mlg: MambaLayerGroup,
         src_slot: int,
         dst_slot: int,
         self_ri: RankInfo,
@@ -466,11 +466,11 @@ class MambaPolicy:
         Returns (src_frags, dst_frags, kv_sizes) — all empty if not applicable.
         """
         self_mlg = next(
-            (lg for lg in self_page_table.layer_groups if lg.mamba_layer_offsets is not None),
+            (lg for lg in self_page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
             None,
         )
         peer_mlg = next(
-            (lg for lg in peer_page_table.layer_groups if lg.mamba_layer_offsets is not None),
+            (lg for lg in peer_page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
             None,
         )
         if self_mlg is None or peer_mlg is None or src_slot is None or dst_slot is None:

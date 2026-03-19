@@ -10,6 +10,7 @@ from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, WaitResult, get_unique_rid
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
+from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
@@ -146,7 +147,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         tokens_per_block = self.kv_cache_manager.tokens_per_block
 
         for group_idx, lg in enumerate(self.page_table.layer_groups):
-            if lg.mamba_layer_offsets is not None:
+            if isinstance(lg, MambaLayerGroup):
                 # Mamba layer groups have no KV cache blocks; skip.
                 block_ids_per_layer_groups.append([])
                 continue

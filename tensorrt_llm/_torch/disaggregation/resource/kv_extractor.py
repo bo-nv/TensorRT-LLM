@@ -11,9 +11,11 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
+    AttentionLayerGroup,
     KVCachePageTable,
     LayerGroup,
     LocalLayer,
+    MambaLayerGroup,
     PhysicalPool,
     PhysicalPoolGroup,
     PoolView,
@@ -87,7 +89,7 @@ class KVRegionExtractorV1(RegionExtractorBase):
 
 def _build_layer_group_for_mamba(
     manager: MambaHybridCacheManager, pool_group_idx: int
-) -> LayerGroup:
+) -> MambaLayerGroup:
     assert isinstance(manager._impl, PythonMambaCacheManager), (
         "CppMambaCacheManager is not supported with Python transceiver, please set TRTLLM_USE_CPP_MAMBA=0"
     )
@@ -125,7 +127,7 @@ def _build_layer_group_for_mamba(
     ssm_elem_size = ssm_state.element_size()
     ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
 
-    return LayerGroup(
+    return MambaLayerGroup(
         pool_group_idx=pool_group_idx,
         mamba_layer_offsets=mamba_layer_offsets,
         conv_states=conv_pool,
@@ -218,7 +220,7 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
             for lid in local_layer_ids
         ]
         layer_groups.append(
-            LayerGroup(
+            AttentionLayerGroup(
                 pool_group_idx=group_id,
                 kv_head_num_per_rank=num_kv_heads,
                 sliding_window_size=window_size,
@@ -410,7 +412,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         sliding_window_size = life_cycle.window_size
 
         layer_groups.append(
-            LayerGroup(
+            AttentionLayerGroup(
                 pool_group_idx=storage_pg_to_list_idx[storage_pg_idx],
                 kv_head_num_per_rank=num_kv_heads,
                 sliding_window_size=sliding_window_size,

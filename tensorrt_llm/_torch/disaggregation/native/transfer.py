@@ -51,6 +51,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
     build_page_table_from_manager,
 )
+from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool, get_pool_bytes
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -1535,7 +1536,7 @@ class TransferWorker:
         pool_counter = 0
 
         for lg_idx, lg in enumerate(page_table.layer_groups):
-            if lg.mamba_layer_offsets is not None:
+            if isinstance(lg, MambaLayerGroup):
                 num_mamba_layers = len(lg.mamba_layer_offsets)
                 for pool in [lg.conv_states, lg.ssm_states]:
                     pool_size = num_mamba_layers * pool.num_slots * pool.slot_bytes

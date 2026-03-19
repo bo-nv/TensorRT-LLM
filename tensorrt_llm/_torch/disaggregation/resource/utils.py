@@ -5,7 +5,7 @@ from typing import Dict, List, Set
 
 from tensorrt_llm._torch.disaggregation.base.region import DataRole as RegionDataRole
 
-from .page import KVCachePageTable, LayerGroup, PhysicalPool, PoolView
+from .page import AttentionLayerGroup, KVCachePageTable, PhysicalPool, PoolView
 
 
 class PoolRole(Enum):
@@ -60,7 +60,9 @@ def get_pool_view_num_layers(pool_view: PoolView) -> int:
     return len(get_unique_layers(pool_view))
 
 
-def get_pool_view_global_layer_ids(pool_view: PoolView, layer_group: LayerGroup) -> List[int]:
+def get_pool_view_global_layer_ids(
+    pool_view: PoolView, layer_group: AttentionLayerGroup
+) -> List[int]:
     """
     Global layer IDs for the layers that appear in *pool_view*, ordered as in
     *layer_group.local_layers*.
@@ -114,14 +116,14 @@ def get_pool_role(pool_view: PoolView, *, kv_factor: int) -> PoolRole:
 # -------------------------------------------------------------------------
 
 
-def get_global_layer_ids(layer_group: LayerGroup) -> List[int]:
+def get_global_layer_ids(layer_group: AttentionLayerGroup) -> List[int]:
     """
     Ordered global layer IDs for *layer_group*
     """
     return [ll.global_layer_id for ll in layer_group.local_layers]
 
 
-def get_layer_group_num_layers(layer_group: LayerGroup) -> int:
+def get_layer_group_num_layers(layer_group: AttentionLayerGroup) -> int:
     """
     Number of layers in *layer_group*
     """
@@ -173,16 +175,21 @@ def get_layer_to_layer_group(page_table: KVCachePageTable) -> Dict[int, int]:
     """
     out: Dict[int, int] = {}
     for lg_idx, lg in enumerate(page_table.layer_groups):
-        for ll in lg.local_layers:
-            out[int(ll.global_layer_id)] = int(lg_idx)
+        if isinstance(lg, AttentionLayerGroup):
+            for ll in lg.local_layers:
+                out[int(ll.global_layer_id)] = int(lg_idx)
     return out
 
 
 def get_num_layers(page_table: KVCachePageTable) -> int:
     """
-    Total number of layers across all layer groups
+    Total number of attention layers across all layer groups
     """
-    return sum(len(lg.local_layers) for lg in page_table.layer_groups)
+    return sum(
+        len(lg.local_layers)
+        for lg in page_table.layer_groups
+        if isinstance(lg, AttentionLayerGroup)
+    )
 
 
 def get_num_layer_groups(page_table: KVCachePageTable) -> int:
@@ -192,19 +199,26 @@ def get_num_layer_groups(page_table: KVCachePageTable) -> int:
 
 def get_pool_views(page_table: KVCachePageTable) -> List[List[PoolView]]:
     """
-    Pool views per layer group
+    Pool views per attention layer group
     """
-    return [lg.pool_views for lg in page_table.layer_groups]
+    return [lg.pool_views for lg in page_table.layer_groups if isinstance(lg, AttentionLayerGroup)]
 
 
 def get_total_pools(page_table: KVCachePageTable) -> int:
     """Total pool-view count."""
-    return sum(len(lg.pool_views) for lg in page_table.layer_groups)
+    return sum(
+        len(lg.pool_views) for lg in page_table.layer_groups if isinstance(lg, AttentionLayerGroup)
+    )
 
 
 def get_total_buffer_entries(page_table: KVCachePageTable) -> int:
     """Total buffer entries across all pools."""
-    return sum(get_num_buffer_entries(pv) for lg in page_table.layer_groups for pv in lg.pool_views)
+    return sum(
+        get_num_buffer_entries(pv)
+        for lg in page_table.layer_groups
+        if isinstance(lg, AttentionLayerGroup)
+        for pv in lg.pool_views
+    )
 
 
 def get_total_pool_bytes(page_table: KVCachePageTable) -> int:
@@ -214,6 +228,7 @@ def get_total_pool_bytes(page_table: KVCachePageTable) -> int:
     return sum(
         get_pool_bytes(get_physical_pool(page_table, lg_idx, pv.pool_idx))
         for lg_idx, lg in enumerate(page_table.layer_groups)
+        if isinstance(lg, AttentionLayerGroup)
         for pv in lg.pool_views
     )
 
@@ -225,5 +240,6 @@ def get_total_slots(page_table: KVCachePageTable) -> int:
     return sum(
         get_physical_pool(page_table, lg_idx, pv.pool_idx).num_slots
         for lg_idx, lg in enumerate(page_table.layer_groups)
+        if isinstance(lg, AttentionLayerGroup)
         for pv in lg.pool_views
     )
