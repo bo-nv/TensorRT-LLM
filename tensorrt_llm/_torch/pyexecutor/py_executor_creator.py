@@ -712,8 +712,9 @@ def create_py_executor(
                      and cache_transceiver_config.backend is not None)
         is_hybrid = is_nemotron_hybrid(config) or is_qwen3_next(config)
 
-        if (is_disagg and is_hybrid
-            if cache_transceiver_config.transceiver_runtime != "PYTHON" or os.environ.get("TRTLLM_USE_CPP_MAMBA") == "1"):
+        if is_disagg and is_hybrid:
+            if cache_transceiver_config.transceiver_runtime != "PYTHON" or os.environ.get(
+                    "TRTLLM_USE_CPP_MAMBA") == "1":
                 logger.info("Disaggregated serving with hybrid model detected. "
                             "Enabling C++ MambaCacheManager.")
                 os.environ["TRTLLM_USE_CPP_MAMBA"] = "1"
