@@ -710,7 +710,7 @@ def create_py_executor(
 
         is_disagg = (cache_transceiver_config is not None
                      and cache_transceiver_config.backend is not None)
-        is_hybrid = is_nemotron_hybrid(config) or is_qwen3_next(config)
+        is_hybrid = is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
 
         if is_disagg and is_hybrid:
             if cache_transceiver_config.transceiver_runtime != "PYTHON" or os.environ.get(
