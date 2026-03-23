@@ -521,19 +521,19 @@ class Sender(SenderBase):
                     frag_size = rp.src.memory.bytes_per_region  # type: ignore[attr-defined]
                     kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))  # type: ignore[attr-defined]
 
-        # handle mamba fragments
-        m_src, m_dst, m_sizes = MambaPolicy.collect_frags(
-            self_page_table=extractor.page_table,
-            peer_page_table=peer_extractor.page_table,
-            src_slot=self._slice.mamba_state_index,
-            dst_slot=req_info.mamba_state_index,
-            self_ri=self._registrar.self_rank_info,
-            peer_ri=peer_ri,
-        )
-        if m_src:
-            src_frags.extend(m_src)
-            dst_frags.extend(m_dst)
-            kv_sizes.extend(m_sizes)
+            # handle mamba fragments
+            m_src, m_dst, m_sizes = MambaPolicy.collect_frags(
+                self_page_table=extractor.page_table,
+                peer_page_table=peer_extractor.page_table,
+                src_slot=task._slice.mamba_state_index,
+                dst_slot=req_info.mamba_state_index,
+                self_ri=self._registrar.self_rank_info,
+                peer_ri=peer_ri,
+            )
+            if m_src:
+                src_frags.extend(m_src)
+                dst_frags.extend(m_dst)
+                kv_sizes.extend(m_sizes)
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
