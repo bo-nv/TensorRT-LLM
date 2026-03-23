@@ -988,6 +988,7 @@ class Receiver(ReceiverBase):
             block_ids_per_layer_groups=task._kv_slice.block_ids_per_layer_groups,
             unique_rid=task._unique_rid,
             aux_slot=task._aux_slot,
+            mamba_state_index=task._kv_slice.mamba_state_index,
         )
 
     def dispatch_task(self, task: KVRecvTask):
