@@ -575,7 +575,12 @@ class PyExecutor:
                         self.kv_connector_manager.layer_post_hook)
 
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
-        if self.async_transfer_manager.end_transfer(request):
+        should_terminate = self.async_transfer_manager.end_transfer(request)
+        logger.info(
+            f"[PP_XFER] pp_rank={self.dist.pp_rank} req_id={request.py_request_id} "
+            f"end_transfer -> should_terminate={should_terminate} state={request.state}"
+        )
+        if should_terminate:
             self._terminate_request(request)
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
@@ -1222,6 +1227,15 @@ class PyExecutor:
         if self.scheduler.can_schedule(scheduled_batch_requests):
             return
 
+        inflight = self.async_transfer_manager.has_any_inflight_requests()
+        logger.info(
+            f"[PP_SCHED] pp_rank={self.dist.pp_rank} iter={self.iter_counter} "
+            f"cannot schedule batch_size={scheduled_batch.batch_size} "
+            f"ctx={scheduled_batch.num_context_requests} gen={scheduled_batch.num_generation_requests} "
+            f"has_inflight_transfers={inflight} "
+            f"enable_kv_cache_reuse={self.enable_kv_cache_reuse} "
+            f"has_pp_term_handler={self._disagg_pp_termination_handler is not None}"
+        )
         logger.warning(
             "Cannot run first PP's schedule result due to limited KV cache resources. This may cause bubbles in the PP pipeline. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value."
         )
@@ -1272,6 +1286,16 @@ class PyExecutor:
                 new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
                     break
+
+                req_states = {}
+                for r in self.active_requests:
+                    s = str(r.state).split('.')[-1]
+                    req_states[r.py_request_id] = s
+                logger.info(
+                    f"[PP_LOOP] pp_rank={self.dist.pp_rank} iter={self.iter_counter} "
+                    f"mb={microbatch_id} active={len(self.active_requests)} "
+                    f"new={len(new_requests)} unhandled_batches={self.unhandled_batch_counter} "
+                    f"req_states={req_states}")
 
                 self._handle_control_request()
 
@@ -1506,10 +1530,21 @@ class PyExecutor:
                     executed_batch_num = len(executed_batches)
 
                 # Stage 3.2: Broadcast the number of executed batches to other ranks.
+                logger.info(
+                    f"[PP_LOOP] pp_rank={self.dist.pp_rank} iter={self.iter_counter} "
+                    f"Stage3.2 broadcast executed_batch_num={executed_batch_num}"
+                )
                 executed_batch_num = ring_broadcast_executed_batch_num(
                     executed_batch_num)
+                logger.info(
+                    f"[PP_LOOP] pp_rank={self.dist.pp_rank} iter={self.iter_counter} "
+                    f"Stage3.2 done, received executed_batch_num={executed_batch_num}"
+                )
 
                 # Stage 3.3: Handle executed batches.
+                logger.info(
+                    f"[PP_LOOP] pp_rank={self.dist.pp_rank} iter={self.iter_counter} "
+                    f"Stage3.3 handle_executed_batches({executed_batch_num})")
                 handle_executed_batches(executed_batch_num)
 
                 # Stage 4: March forward in microbatch slots
@@ -1558,13 +1593,26 @@ class PyExecutor:
         sample_state = executed_batch.sample_state
         requests = sample_state.requests
 
+        req_ids = [r.py_request_id for r in requests]
+        logger.info(
+            f"[PP_BCAST] pp_rank={self.dist.pp_rank} mb={microbatch_id} "
+            f"num_reqs={len(requests)} req_ids={req_ids} "
+            f"is_last_pp={self.dist.is_last_pp_rank}")
+
         if not self.dist.is_last_pp_rank:
             # Receive tokens from previous pp rank (w.r.t model forward direction)
+            logger.info(
+                f"[PP_BCAST] pp_rank={self.dist.pp_rank} mb={microbatch_id} "
+                f"waiting recv_object from prev_pp_rank={self.dist.prev_pp_rank}"
+            )
             with nvtx_range("recv_sample_state"):
                 sample_state.host, py_result_diffs = self.dist.recv_object(
                     src=self.dist.prev_pp_rank,
                     tag=tag,
                 )
+            logger.info(
+                f"[PP_BCAST] pp_rank={self.dist.pp_rank} mb={microbatch_id} "
+                f"recv_object done from prev_pp_rank={self.dist.prev_pp_rank}")
 
             for request, py_result_diff in zip(requests, py_result_diffs):
                 request.py_result.apply_diff(py_result_diff)
@@ -1594,8 +1642,24 @@ class PyExecutor:
                 self._update_requests(executed_batch.sample_state)
 
                 scheduled_requests = executed_batch.scheduled_requests
+                ctx_req_ids = [
+                    r.py_request_id for r in scheduled_requests.context_requests
+                ]
+                gen_req_ids = [
+                    r.py_request_id
+                    for r in scheduled_requests.generation_requests
+                ]
+                logger.info(
+                    f"[PP_EXEC] pp_rank={self.dist.pp_rank} iter={self.iter_counter} "
+                    f"mb={executed_batch.microbatch_id} "
+                    f"ctx_reqs={ctx_req_ids} gen_reqs={gen_req_ids}")
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
+                    if finished_ctx_reqs:
+                        logger.info(
+                            f"[PP_EXEC] pp_rank={self.dist.pp_rank} "
+                            f"sending KV for ctx_reqs={[r.py_request_id for r in finished_ctx_reqs]}"
+                        )
                     self._send_kv_async(finished_ctx_reqs)
                 self._handle_canceled_requests()
 
@@ -3009,6 +3073,11 @@ class PyExecutor:
                 if req.is_context_only_request and (
                         req.is_context_finished or req.is_finished_due_to_length
                 ) and not req.is_finished_due_to_cancellation:
+                    logger.info(
+                        f"[PP_SEND_KV] pp_rank={self.dist.pp_rank} req_id={req.py_request_id} "
+                        f"start_transfer + respond_and_send_async "
+                        f"should_store_blocks={self.async_transfer_manager.should_store_blocks}"
+                    )
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
@@ -3050,6 +3119,12 @@ class PyExecutor:
             atLeastNum)
 
         completed_req_ids = set(finished_requests + error_requests)
+        if completed_req_ids:
+            in_transfer_ids = list(
+                self.async_transfer_manager.requests_in_transfer().keys())
+            logger.info(f"[PP_CTX_XFER] pp_rank={self.dist.pp_rank} "
+                        f"finished={finished_requests} errors={error_requests} "
+                        f"in_transfer={in_transfer_ids}")
 
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
@@ -3292,11 +3367,21 @@ class PyExecutor:
         # but the dummy ID is reused every iteration).
         if (self._disagg_pp_termination_handler is not None
                 and not request.is_dummy_request):
+            logger.info(
+                f"[PP_TERM_REQ] pp_rank={self.dist.pp_rank} req_id={request.py_request_id} "
+                f"-> PP_TERM_HANDLER (state={request.state})")
             self._disagg_pp_termination_handler.terminate(request)
         else:
+            logger.info(
+                f"[PP_TERM_REQ] pp_rank={self.dist.pp_rank} req_id={request.py_request_id} "
+                f"-> direct _do_terminate (state={request.state} is_dummy={request.is_dummy_request})"
+            )
             self._do_terminate_request(request)
 
     def _do_terminate_request(self, request: LlmRequest):
+        logger.info(
+            f"[PP_TERM_REQ] pp_rank={self.dist.pp_rank} req_id={request.py_request_id} "
+            f"free_resources (state={request.state})")
         self.resource_manager.free_resources(request)
 
         if self.gather_all_responses or self.dist.rank == 0:
@@ -3487,6 +3572,11 @@ class PyExecutor:
                     new_responses.append((req_id, response))
 
             if request_done:
+                logger.info(
+                    f"[PP_RESP] pp_rank={self.dist.pp_rank} req_id={req_id} DONE "
+                    f"state={request.state} is_ctx_only={request.is_context_only_request} "
+                    f"is_ctx_trans={request.is_disagg_context_transmission_state}"
+                )
                 if (self.drafter is not None and getattr(
                         self.model_engine, 'enable_spec_decode', False)
                         and not self.speculation_permanently_disabled
@@ -3520,6 +3610,11 @@ class PyExecutor:
                 else:
                     if not request.is_disagg_context_transmission_state:
                         requests_to_terminate.append(request)
+                    else:
+                        logger.info(
+                            f"[PP_RESP] pp_rank={self.dist.pp_rank} req_id={req_id} "
+                            f"DEFERRED termination (ctx_transmission in progress)"
+                        )
             else:
                 new_active_requests.append(request)
 
@@ -3668,6 +3763,10 @@ class DisaggPPTerminationHandler:
         self._comm_tag = PPCommTag.TERMINATION
 
     def terminate(self, request: LlmRequest):
+        logger.info(
+            f"[PP_TERM] pp_rank={self._dist.pp_rank} iter={self._terminating_iteration} "
+            f"enqueue req_id={request.py_request_id} pending={list(self._pending_termination.keys())}"
+        )
         self._pending_termination[request.py_request_id] = request
 
     @nvtx_range("_disagg_pp_termination_handler_sync")
@@ -3683,6 +3782,9 @@ class DisaggPPTerminationHandler:
 
         if not (self._dist.is_first_pp_rank
                 and self._terminating_iteration == 0):
+            logger.info(
+                f"[PP_TERM] pp_rank={self._dist.pp_rank} iter={self._terminating_iteration} "
+                f"waiting recv from prev_pp_rank={self._dist.prev_pp_rank}")
             term_state = self._dist.recv_object(src=self._dist.prev_pp_rank,
                                                 tag=self._comm_tag)
 
@@ -3690,6 +3792,11 @@ class DisaggPPTerminationHandler:
         }  # {req_id: num_ranks} ranks vote in the ready dict
         terminate_req_ids = term_state["term"] if term_state else [
         ]  # request ids to be terminated in the current iteration
+
+        logger.info(
+            f"[PP_TERM] pp_rank={self._dist.pp_rank} iter={self._terminating_iteration} "
+            f"recv term_state: ready={ready_req_map} term={terminate_req_ids} "
+            f"pending={list(self._pending_termination.keys())}")
 
         reqs_to_terminate = {
             req_id: self._pending_termination.pop(req_id, None)
@@ -3705,12 +3812,26 @@ class DisaggPPTerminationHandler:
             for req_id in ready_req_map.keys():
                 if req_id in self._pending_termination:
                     ready_req_map[req_id] += 1
+                else:
+                    logger.warning(
+                        f"[PP_TERM] pp_rank={self._dist.pp_rank} iter={self._terminating_iteration} "
+                        f"req_id={req_id} NOT in pending (vote mismatch!)")
 
         if self._dist.is_last_pp_rank:
             new_terminate_req_ids = [
                 req_id for req_id, num_ranks in ready_req_map.items()
                 if num_ranks == self._dist.pp_size
             ]
+            stuck_req_ids = {
+                req_id: num_ranks
+                for req_id, num_ranks in ready_req_map.items()
+                if num_ranks < self._dist.pp_size
+            }
+            if stuck_req_ids:
+                logger.warning(
+                    f"[PP_TERM] pp_rank={self._dist.pp_rank} iter={self._terminating_iteration} "
+                    f"STUCK requests (votes < pp_size={self._dist.pp_size}): {stuck_req_ids}"
+                )
             # by determining the terminate ids in the last rank, we can save the overhead of sending the ready dict back to rank0
             new_term_state = {"ready": {}, "term": new_terminate_req_ids}
         else:
@@ -3718,13 +3839,18 @@ class DisaggPPTerminationHandler:
             # terminate_req_ids will not change in a given iteration, so we can terminate the requests synchronously
             new_term_state = {"ready": ready_req_map, "term": terminate_req_ids}
 
+        logger.info(
+            f"[PP_TERM] pp_rank={self._dist.pp_rank} iter={self._terminating_iteration} "
+            f"send to next_pp_rank={self._dist.next_pp_rank} "
+            f"new_state: ready={new_term_state['ready']} term={new_term_state['term']}"
+        )
         self._send_handle = self._dist.isend_object(
             new_term_state, dest=self._dist.next_pp_rank, tag=self._comm_tag)
 
         if reqs_to_terminate:
-            logger.debug(
-                f'rank {self._dist.pp_rank} terminates {list(reqs_to_terminate.keys())} in iter {self._terminating_iteration}'
-            )
+            logger.info(
+                f"[PP_TERM] pp_rank={self._dist.pp_rank} iter={self._terminating_iteration} "
+                f"TERMINATING reqs={list(reqs_to_terminate.keys())}")
         for req_id, req in reqs_to_terminate.items():
             if req:
                 self._terminator_func(req)
