@@ -951,6 +951,13 @@ class PyExecutor:
                 host_step_time = (end_time - start_time) * 1000  # milliseconds
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
+                # Build sub-stage timing string if available
+                substage_str = ""
+                if hasattr(self, '_substage_times') and self._substage_times:
+                    parts = []
+                    for name, dur_ms in self._substage_times.items():
+                        parts.append(f"{name}={dur_ms:.2f}")
+                    substage_str = f", substages=[{', '.join(parts)}]"
                 logger.info(
                     f"iter = {self.iter_counter}, "
                     f"global_rank = {self.global_rank}, "
@@ -961,7 +968,8 @@ class PyExecutor:
                     f"prev_device_step_time = {prev_device_step_time}, "
                     f"timestamp = {formatted_timestamp}, "
                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
-                    f"states = {self.model_engine.iter_states}")
+                    f"states = {self.model_engine.iter_states}"
+                    f"{substage_str}")
 
             it += 1
 
@@ -1333,6 +1341,7 @@ class PyExecutor:
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
+                _t0 = time.time()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
@@ -1346,6 +1355,7 @@ class PyExecutor:
                 if self.kv_cache_transceiver:
                     self._check_disagg_ctx_schedulable_status(new_requests)
                     self._check_disagg_gen_transfer_status()
+                _t_fetch = time.time()
 
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
@@ -1354,6 +1364,7 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
+                _t_pre_schedule = time.time()
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._pp_schedule_and_propagate(
                     microbatch_id)
@@ -1429,6 +1440,7 @@ class PyExecutor:
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
 
+                    _t_pre_forward = time.time()
                     # Stage 1.1: Async forward (all ranks) and decoding pass (last rank only)
                     if not self.dist.is_last_pp_rank:
                         with torch.cuda.nvtx.range(
@@ -1497,6 +1509,7 @@ class PyExecutor:
                     )
 
                     self.micro_batches[microbatch_id] = batch_state
+                _t_post_forward = time.time()
 
                 # Stage 1.2: Sync sampler for previous microbatch to start new sample state comm chain.
                 # For last PP rank, we must synchronize the previous batch
@@ -1591,6 +1604,20 @@ class PyExecutor:
 
                 # Stage 3.3: Handle executed batches.
                 handle_executed_batches(executed_batch_num)
+                _t_post_handle = time.time()
+
+                # Record sub-stage timings for the log
+                self._substage_times = {
+                    'fetch_check': (_t_fetch - _t0) * 1000,
+                    'schedule':
+                    (_t_pre_forward - _t_fetch) * 1000 if can_queue else
+                    (_t_post_forward - _t_fetch) * 1000,
+                }
+                if can_queue:
+                    self._substage_times['fwd_sample'] = (_t_post_forward -
+                                                          _t_pre_forward) * 1000
+                self._substage_times['bcast_handle'] = (_t_post_handle -
+                                                        _t_post_forward) * 1000
 
                 # Stage 4: March forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
