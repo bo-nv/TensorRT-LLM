@@ -1593,14 +1593,20 @@ class PyExecutor:
 
                 executed_batch_num = 0
 
+                _t_bh_sync = time.time()
+
                 # Stage 3.1: The first rank determines the number of executed batches.
                 if self.dist.rank == 0:
                     executed_batches = fetch_executed_batches()
                     executed_batch_num = len(executed_batches)
 
+                _t_bh_fetch = time.time()
+
                 # Stage 3.2: Broadcast the number of executed batches to other ranks.
                 executed_batch_num = ring_broadcast_executed_batch_num(
                     executed_batch_num)
+
+                _t_bh_bcast = time.time()
 
                 # Stage 3.3: Handle executed batches.
                 handle_executed_batches(executed_batch_num)
@@ -1618,6 +1624,17 @@ class PyExecutor:
                                                           _t_pre_forward) * 1000
                 self._substage_times['bcast_handle'] = (_t_post_handle -
                                                         _t_post_forward) * 1000
+                self._substage_times['bh_sync_sampler'] = (
+                    _t_bh_sync - _t_post_forward) * 1000
+                self._substage_times['bh_fetch'] = (_t_bh_fetch -
+                                                    _t_bh_sync) * 1000
+                self._substage_times['bh_ring_bcast'] = (_t_bh_bcast -
+                                                         _t_bh_fetch) * 1000
+                self._substage_times['bh_handle'] = (_t_post_handle -
+                                                     _t_bh_bcast) * 1000
+                if hasattr(self, '_handle_batch_substages'):
+                    for k, v in self._handle_batch_substages.items():
+                        self._substage_times[f'hb_{k}'] = v
 
                 # Stage 4: March forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
@@ -1705,19 +1722,24 @@ class PyExecutor:
         finished_requests = []
         if executed_batch is not None:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
+                _th0 = time.time()
                 self._update_requests(executed_batch.sample_state)
+                _th1 = time.time()
 
                 scheduled_requests = executed_batch.scheduled_requests
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
+                _th2 = time.time()
                 self._handle_canceled_requests()
 
                 finished_requests = self._handle_responses()
+                _th3 = time.time()
                 # Complete ctx send sessions AFTER responses are created so
                 # _handle_responses sees the request before it is terminated.
                 if self.kv_cache_transceiver:
                     self._check_disagg_ctx_cache_transfer_status(0)
+                _th4 = time.time()
                 sample_state_scheduled_requests = executed_batch.scheduled_requests
                 attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                         None)
@@ -1729,6 +1751,14 @@ class PyExecutor:
                     kv_cache_dtype_byte_size)
 
                 self._remove_inflight_ids(scheduled_requests)
+                _th5 = time.time()
+                self._handle_batch_substages = {
+                    'update_requests': (_th1 - _th0) * 1000,
+                    'send_kv': (_th2 - _th1) * 1000,
+                    'handle_responses': (_th3 - _th2) * 1000,
+                    'check_ctx_transfer': (_th4 - _th3) * 1000,
+                    'update_resources': (_th5 - _th4) * 1000,
+                }
 
         if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
         ):
