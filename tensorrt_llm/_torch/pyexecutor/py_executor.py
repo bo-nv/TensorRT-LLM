@@ -1518,10 +1518,12 @@ class PyExecutor:
                 previous_batch = self.previous_batch
                 if can_queue:
                     self.previous_batch = batch_state
+                _t_bf_sync0 = time.time()
                 if (self.dist.is_last_pp_rank
                         or can_queue) and previous_batch is not None:
                     with nvtx_range("sync_previous_sampler_event"):
                         previous_batch.sample_state.sampler_event.synchronize()
+                _t_bf_sync1 = time.time()
 
                 # Stage 2: Enqueue sample state for executed batch to ring broadcast it in background thread asynchronously.
                 # send/recv chain: (pp_size - 1) -> 0 -> 1 -> ... -> (pp_size - 2)
@@ -1535,6 +1537,7 @@ class PyExecutor:
                     self.executed_batch_queue.put(executed_batch)
                     self.unhandled_batch_counter += 1
                 self.micro_batches[executed_microbatch_id] = None
+                _t_bf_enqueue = time.time()
 
                 def fetch_executed_batches() -> list[BatchStatePP]:
                     executed_batches = []
@@ -1543,28 +1546,43 @@ class PyExecutor:
                         must_get = not can_queue
                     else:
                         must_get = True
+                    _tf_wait_total = 0.0
                     while not self.executed_batch_response_queue.empty() or (
                             must_get and self.unhandled_batch_counter > 0):
+                        _tf0 = time.time()
                         with nvtx_range("get_executed_batch"):
                             executed_batches.append(
                                 self.executed_batch_response_queue.get())
+                        _tf_wait_total += time.time() - _tf0
                         must_get = False
+                    self._fetch_substages = {
+                        'queue_wait':
+                        _tf_wait_total * 1000,
+                        'must_get':
+                        not can_queue
+                        if self.pp_async_broadcast_sample_state else True,
+                        'num_batches':
+                        len(executed_batches),
+                    }
                     return executed_batches
 
                 def ring_broadcast_executed_batch_num(
                         executed_batch_num: int) -> int:
+                    _tr0 = time.time()
                     if self.dist.is_first_pp_rank and self.dist.tp_size * self.dist.cp_size > 1:
                         with nvtx_range("tp_cp_broadcast_executed_batch_num"):
                             executed_batch_num = self.dist.tp_cp_broadcast(
                                 executed_batch_num,
                                 root=0,
                             )
+                    _tr1 = time.time()
                     if not self.dist.is_first_pp_rank:
                         with nvtx_range("recv_expected_batch_num"):
                             executed_batch_num = self.dist.recv_object(
                                 src=self.dist.prev_pp_rank,
                                 tag=PPCommTag.EXECUTED_BATCH_NUM,
                             )
+                    _tr2 = time.time()
                     if not self.dist.is_last_pp_rank:
                         self.wait_on_pp_send_handles(
                             self.send_expected_batch_num_handles, microbatch_id)
@@ -1575,6 +1593,12 @@ class PyExecutor:
                                     dest=self.dist.next_pp_rank,
                                     tag=PPCommTag.EXECUTED_BATCH_NUM,
                                 )
+                    _tr3 = time.time()
+                    self._ring_bcast_substages = {
+                        'tp_cp_bcast': (_tr1 - _tr0) * 1000,
+                        'pp_recv': (_tr2 - _tr1) * 1000,
+                        'pp_send': (_tr3 - _tr2) * 1000,
+                    }
                     return executed_batch_num
 
                 def handle_executed_batches(executed_batch_num: int):
@@ -1593,22 +1617,20 @@ class PyExecutor:
 
                 executed_batch_num = 0
 
-                _t_bh_sync = time.time()
+                _t_bh0 = time.time()
 
-                # Stage 3.1: The first rank determines the number of executed batches.
+                # Stage 3.2: The first rank determines the number of executed batches.
                 if self.dist.rank == 0:
                     executed_batches = fetch_executed_batches()
                     executed_batch_num = len(executed_batches)
+                _t_bh_fetch_done = time.time()
 
-                _t_bh_fetch = time.time()
-
-                # Stage 3.2: Broadcast the number of executed batches to other ranks.
+                # Stage 3.3: Broadcast the number of executed batches to other ranks.
                 executed_batch_num = ring_broadcast_executed_batch_num(
                     executed_batch_num)
+                _t_bh_bcast_done = time.time()
 
-                _t_bh_bcast = time.time()
-
-                # Stage 3.3: Handle executed batches.
+                # Stage 3.4: Handle executed batches.
                 handle_executed_batches(executed_batch_num)
                 _t_post_handle = time.time()
 
@@ -1624,17 +1646,32 @@ class PyExecutor:
                                                           _t_pre_forward) * 1000
                 self._substage_times['bcast_handle'] = (_t_post_handle -
                                                         _t_post_forward) * 1000
-                self._substage_times['bh_sync_sampler'] = (
-                    _t_bh_sync - _t_post_forward) * 1000
-                self._substage_times['bh_fetch'] = (_t_bh_fetch -
-                                                    _t_bh_sync) * 1000
-                self._substage_times['bh_ring_bcast'] = (_t_bh_bcast -
-                                                         _t_bh_fetch) * 1000
+                # -- bh_fetch: from _t_post_forward to _t_bh_bcast_done --
+                self._substage_times['bh_fetch'] = (_t_bh_bcast_done -
+                                                    _t_post_forward) * 1000
+                self._substage_times['  f.sync_sampler'] = (_t_bf_sync1 -
+                                                            _t_bf_sync0) * 1000
+                self._substage_times['  f.enqueue'] = (_t_bf_enqueue -
+                                                       _t_bf_sync1) * 1000
+                self._substage_times['  f.fetch_batches'] = (_t_bh_fetch_done -
+                                                             _t_bh0) * 1000
+                if hasattr(self, '_fetch_substages'):
+                    fs = self._fetch_substages
+                    self._substage_times['    f.queue_wait'] = fs['queue_wait']
+                    self._substage_times['    f.must_get'] = fs['must_get']
+                    self._substage_times['    f.num_batches'] = fs[
+                        'num_batches']
+                self._substage_times['  f.ring_bcast'] = (
+                    _t_bh_bcast_done - _t_bh_fetch_done) * 1000
+                if hasattr(self, '_ring_bcast_substages'):
+                    for k, v in self._ring_bcast_substages.items():
+                        self._substage_times[f'    f.{k}'] = v
+                # -- bh_handle: from _t_bh_bcast_done to _t_post_handle --
                 self._substage_times['bh_handle'] = (_t_post_handle -
-                                                     _t_bh_bcast) * 1000
+                                                     _t_bh_bcast_done) * 1000
                 if hasattr(self, '_handle_batch_substages'):
                     for k, v in self._handle_batch_substages.items():
-                        self._substage_times[f'hb_{k}'] = v
+                        self._substage_times[f'  h.{k}'] = v
 
                 # Stage 4: March forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
@@ -1732,6 +1769,7 @@ class PyExecutor:
                     self._send_kv_async(finished_ctx_reqs)
                 _th2 = time.time()
                 self._handle_canceled_requests()
+                _th2b = time.time()
 
                 finished_requests = self._handle_responses()
                 _th3 = time.time()
@@ -1749,23 +1787,20 @@ class PyExecutor:
                 self.resource_manager.update_resources(
                     sample_state_scheduled_requests, attn_metadata,
                     kv_cache_dtype_byte_size)
+                _th5 = time.time()
 
                 self._remove_inflight_ids(scheduled_requests)
-                _th5 = time.time()
-                self._handle_batch_substages = {
-                    'update_requests': (_th1 - _th0) * 1000,
-                    'send_kv': (_th2 - _th1) * 1000,
-                    'handle_responses': (_th3 - _th2) * 1000,
-                    'check_ctx_transfer': (_th4 - _th3) * 1000,
-                    'update_resources': (_th5 - _th4) * 1000,
-                }
+                _th6 = time.time()
 
+        _th7 = time.time()
         if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
         ):
             self._check_kv_transfer_timeout()
+        _th8 = time.time()
 
         if self._disagg_pp_termination_handler is not None:
             self._disagg_pp_termination_handler.terminate_pending_requests()
+        _th9 = time.time()
 
         if self.enable_iter_perf_stats and executed_batch is not None:
             self._process_iter_stats(
@@ -1774,6 +1809,27 @@ class PyExecutor:
                 executed_batch,
                 executed_batch.microbatch_id % self.dist.pp_size,
             )
+        _th10 = time.time()
+
+        if executed_batch is not None:
+            self._handle_batch_substages = {
+                'update_reqs': (_th1 - _th0) * 1000,
+                'send_kv': (_th2 - _th1) * 1000,
+                'cancel_reqs': (_th2b - _th2) * 1000,
+                'handle_resp': (_th3 - _th2b) * 1000,
+                'chk_ctx_xfer': (_th4 - _th3) * 1000,
+                'update_res': (_th5 - _th4) * 1000,
+                'rm_inflight': (_th6 - _th5) * 1000,
+                'chk_timeout': (_th8 - _th7) * 1000,
+                'pp_terminate': (_th9 - _th8) * 1000,
+                'iter_stats': (_th10 - _th9) * 1000,
+            }
+        else:
+            self._handle_batch_substages = {
+                'chk_timeout': (_th8 - _th7) * 1000,
+                'pp_terminate': (_th9 - _th8) * 1000,
+                'iter_stats': (_th10 - _th9) * 1000,
+            }
 
     @nvtx_range("wait_on_pp_send_handles")
     def wait_on_pp_send_handles(self, send_handles, microbatch_id):
