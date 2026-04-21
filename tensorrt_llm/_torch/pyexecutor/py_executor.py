@@ -2948,9 +2948,24 @@ class PyExecutor:
         if isinstance(self.kv_cache_manager,
                       MambaHybridCacheManager) and self.kv_cache_transceiver:
             if len(scheduled_context_requests) > 0:
+                pre_filter = len(scheduled_context_requests)
                 scheduled_context_requests = self.kv_cache_manager.filter_ctx_requests_by_capacity(
                     scheduled_context_requests)
                 num_fitting = len(scheduled_context_requests)
+                if num_fitting < pre_filter:
+                    inflight = self.async_transfer_manager.requests_in_transfer(
+                    )
+                    inflight_info = {
+                        rid:
+                        f"{(time.time() - req.py_kv_transfer_start_time)*1000:.0f}ms"
+                        for rid, req in inflight.items()
+                        if req.py_kv_transfer_start_time is not None
+                    }
+                    logger.warning(
+                        f"Mamba filter: {pre_filter} -> {num_fitting} ctx requests, "
+                        f"free_blocks={len(self.kv_cache_manager._impl.mamba_cache_free_blocks)}, "
+                        f"inflight_transfers={len(inflight)}, "
+                        f"inflight_elapsed={inflight_info}")
         scheduled_requests = ScheduledRequests()
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
@@ -2995,8 +3010,9 @@ class PyExecutor:
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
             if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
                 logger.warning(
-                    f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
-                )
+                    f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout "
+                    f"(elapsed={elapsed_time:.0f}ms, timeout={timeout_ms}ms, "
+                    f"start_time={req.py_kv_transfer_start_time:.3f})")
                 req.py_kv_transfer_timed_out = True
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
@@ -3260,6 +3276,9 @@ class PyExecutor:
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.time()
+                        logger.info(
+                            f"Transfer started: req={req.py_request_id}, "
+                            f"start_time={req.py_kv_transfer_start_time:.3f}")
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
@@ -3295,6 +3314,11 @@ class PyExecutor:
 
         completed_req_ids = set(finished_requests + error_requests)
 
+        if finished_requests or error_requests:
+            logger.info(
+                f"Transfer status(atLeast={atLeastNum}): "
+                f"finished={finished_requests}, errors={error_requests}")
+
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
 
@@ -3306,6 +3330,11 @@ class PyExecutor:
                 continue
 
             request = requests_in_transfer[request_id]
+            elapsed = (time.time() - request.py_kv_transfer_start_time
+                       ) * 1000 if request.py_kv_transfer_start_time else 0
+            logger.info(
+                f"Transfer completed: req={request_id}, elapsed={elapsed:.0f}ms, "
+                f"is_error={request_id in error_requests}")
 
             self._end_transfer_and_maybe_terminate(request)
 
@@ -3316,6 +3345,12 @@ class PyExecutor:
         for request_id in list(requests_in_transfer.keys()):
             request = requests_in_transfer[request_id]
             if request.py_kv_transfer_timed_out and request_id not in completed_req_ids:
+                elapsed = (time.time() - request.py_kv_transfer_start_time
+                           ) * 1000 if request.py_kv_transfer_start_time else 0
+                logger.warning(
+                    f"Attempting cancel for timed-out request {request_id}, "
+                    f"elapsed={elapsed:.0f}ms, timed_out={request.py_kv_transfer_timed_out}"
+                )
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 # If cancel is successful, mark as complete so it can be cleaned up
                 # Otherwise, try at next iteration
