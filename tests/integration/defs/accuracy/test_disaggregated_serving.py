@@ -2051,9 +2051,21 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(8)
     @parametrize_with_ids("use_py_transceiver", [True, False])
-    def test_auto_dtype(self, use_py_transceiver):
+    @parametrize_with_ids("block_reuse", [True, False])
+    @parametrize_with_ids("mtp_nextn", [0, 1, 3])
+    def test_auto_dtype(self, use_py_transceiver, block_reuse, mtp_nextn):
+        if use_py_transceiver and block_reuse:
+            pytest.skip("Python transceiver does not support block reuse")
+
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
             "UCX", use_py_transceiver)
+        if mtp_nextn > 0:
+            spec = {"decoding_type": "MTP", "max_draft_len": mtp_nextn}
+            ctx_cfg["speculative_config"] = spec
+            gen_cfg["speculative_config"] = spec
+        if block_reuse:
+            ctx_cfg["kv_cache_config"]["enable_block_reuse"] = True
+            gen_cfg["kv_cache_config"]["enable_block_reuse"] = True
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
