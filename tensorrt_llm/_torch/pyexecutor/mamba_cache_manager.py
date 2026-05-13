@@ -1306,26 +1306,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 # don't care which half of doulbe-buffer is using
                 # self.cache_buf_idx[ctx_slots] = 0
 
-        # DIAG: Verify pool data is non-zero for gen requests (disagg verification)
-        num_gen = len(scheduled_batch.generation_requests)
-        if num_gen > 0 and num_gen <= 4:
-            from tensorrt_llm import logger as _logger
-            num_ctx = len(scheduled_batch.context_requests)
-            for gi, req in enumerate(scheduled_batch.generation_requests):
-                idx = self.cuda_state_indices[num_ctx + gi].item()
-                ssm_slice = self.all_ssm_states[0, idx]  # layer 0
-                conv_slice = self.all_conv_states[0, idx]  # layer 0
-                ssm_abs_sum = ssm_slice.to(torch.float32).abs().sum().item()
-                conv_abs_sum = conv_slice.to(torch.float32).abs().sum().item()
-                ssm_nonzero = (ssm_slice != 0).sum().item()
-                conv_nonzero = (conv_slice != 0).sum().item()
-                _logger.info(
-                    f"POOL_VERIFY gen[{gi}]: state_idx={idx}, "
-                    f"ssm_abs_sum={ssm_abs_sum:.4f}, ssm_nonzero={ssm_nonzero}/{ssm_slice.numel()}, "
-                    f"conv_abs_sum={conv_abs_sum:.4f}, conv_nonzero={conv_nonzero}/{conv_slice.numel()}, "
-                    f"prompt_len={req.prompt_len}, num_tokens={self.get_num_tokens(req)}, "
-                    f"is_ctx_finished={req.is_context_finished}")
-
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
         self._prepare_resources(scheduled_batch)

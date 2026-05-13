@@ -425,7 +425,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
     SizeType32 const numKvPools = static_cast<SizeType32>(kvWindowSizes.size());
 
-    TLLM_LOG_INFO("CacheFormatter::format: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%lu",
+    TLLM_LOG_DEBUG("CacheFormatter::format: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%lu",
         allWindowSizes.size(), numKvPools, numPools, llmRequest.mRequestId);
 
     // Send recurrent state blocks from the unified KV pool (CppMambaHybridCacheManager path).
@@ -464,7 +464,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         auto rnnSendConns = cache_formatter_utils::pickSendConnections(
             connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks(), rnnTargetInfo);
 
-        TLLM_LOG_INFO(
+        TLLM_LOG_DEBUG(
             "sendRecurrentStates: tpMismatch=%d, selfTP=%d, destTP=%d, hasRnnConfig=%d, rnnConns=%zu, requestId=%lu",
             tpMismatch ? 1 : 0, selfConfig.getParallelConfig().mTensorParallelism,
             destConfig.getParallelConfig().mTensorParallelism, selfConfig.hasRnnConfig() ? 1 : 0, rnnSendConns.size(),
@@ -521,7 +521,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                         }
                     }
                 }
-                TLLM_LOG_INFO(
+                TLLM_LOG_DEBUG(
                     "sendRecurrentStates (same-TP): windowSize=0x%x, totalBlockIds=%zu, realBlocks=%d, numLayers=%d, "
                     "totalBytesSent=%zu, poolShape=%s, requestId=%lu",
                     ws, it->second.size(), realBlockCount, numLayers, totalBytesSent,
@@ -625,7 +625,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                     session.send(connIdx, convOutputBuffers[t]->data(), convOutputBuffers[t]->getSizeInBytes());
                 }
 
-                TLLM_LOG_INFO(
+                TLLM_LOG_DEBUG(
                     "sendRecurrentStates (TP-mismatch split): windowSize=0x%x, realBlocks=%zu, numTargets=%zu, "
                     "totalBytesSent=%zu, ssmBytes=%zu, convBytes=%zu, requestId=%lu",
                     ws, realBlockIndices.size(), numTargets, totalBytesSent, ssmBytes, convBytes,
@@ -900,7 +900,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     }
     SizeType32 const numKvPools = static_cast<SizeType32>(kvWindowSizes.size());
 
-    TLLM_LOG_INFO("CacheFormatter::unformat: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%lu",
+    TLLM_LOG_DEBUG("CacheFormatter::unformat: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%lu",
         allWindowSizes.size(), numKvPools, numPools, llmRequest.mRequestId);
 
     // Receive recurrent state blocks into the unified KV pool (CppMambaHybridCacheManager path).
@@ -922,7 +922,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks(), rnnTargetInfo);
         auto rnnRecvConns = std::get<0>(rnnRecvResult);
 
-        TLLM_LOG_INFO(
+        TLLM_LOG_DEBUG(
             "recvRecurrentStates: tpMismatch=%d, selfTP=%d, destTP=%d, hasRnnConfig=%d, rnnRecvConns=%zu, "
             "requestId=%lu",
             tpMismatch ? 1 : 0, selfConfig.getParallelConfig().mTensorParallelism,
@@ -969,12 +969,6 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                     }
                     ++realBlockCount;
                     auto const blockIdx = static_cast<runtime::ITensor::DimType64>(block->getMemoryPoolBlockIndex());
-                    TLLM_LOG_INFO(
-                        "recvRecurrentStates DIAG: blockId=%d, memPoolIdx=%lld, numLayers=%d, bytesPerLayer=%zu, "
-                        "poolPtr=%p, requestId=%lu",
-                        blockId, blockIdx, numLayers,
-                        numLayers > 0 ? runtime::ITensor::slice(pool, {0, blockIdx}, 1)->getSizeInBytes() : 0,
-                        pool->data(), llmRequest.mRequestId);
                     for (SizeType32 layerIdx = 0; layerIdx < numLayers; ++layerIdx)
                     {
                         auto blockTensor = runtime::ITensor::slice(pool, {layerIdx, blockIdx}, 1);
@@ -986,7 +980,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                         }
                     }
                 }
-                TLLM_LOG_INFO(
+                TLLM_LOG_DEBUG(
                     "recvRecurrentStates (same-TP): windowSize=0x%x, totalBlockIds=%zu, realBlocks=%d, numLayers=%d, "
                     "totalBytesRecv=%zu, poolShape=%s, requestId=%lu",
                     ws, it->second.size(), realBlockCount, numLayers, totalBytesRecv,
@@ -1082,7 +1076,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
 
                 bufferManager.getStream().synchronize();
 
-                TLLM_LOG_INFO(
+                TLLM_LOG_DEBUG(
                     "recvRecurrentStates (TP-mismatch concat): windowSize=0x%x, realBlocks=%zu, numSources=%zu, "
                     "totalBytesRecv=%zu, requestId=%lu",
                     ws, realBlockIndices.size(), numSources, totalBytesRecv, llmRequest.mRequestId);
