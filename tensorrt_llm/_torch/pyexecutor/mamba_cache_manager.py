@@ -1464,18 +1464,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             self._request_id_to_state_index[
                 req.py_request_id] = host_block_offsets[i].item()
 
-        # Debug: log state index mapping for first few requests
-        if len(self.requests) > 0 and len(self.requests) <= 4:
-            from tensorrt_llm import logger as _logger
-            for i, req in enumerate(self.requests):
-                _logger.info(
-                    f"_setup_state_indices: req[{i}] req_id={req.py_request_id}, "
-                    f"prompt_len={req.prompt_len}, "
-                    f"is_context_finished={req.is_context_finished}, "
-                    f"block_index={block_indices[i]}, "
-                    f"pool_block_offset={host_block_offsets[i].item()}, "
-                    f"num_tokens={self.get_num_tokens(req)}")
-
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,
                           is_padding: Optional[List[bool]] = None) -> list:

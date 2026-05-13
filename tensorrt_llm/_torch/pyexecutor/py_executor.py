@@ -3555,38 +3555,6 @@ class PyExecutor:
                     requests)
             self._setup_sampler_step(requests)
 
-        # DIAG: Verify recurrent state pool after disagg transfer
-        if cache_trans_complete_requests:
-            kv_mgr = self.resource_manager.resource_managers.get(
-                ResourceManagerType.KV_CACHE_MANAGER)
-            if kv_mgr is not None and hasattr(kv_mgr, 'all_ssm_states'):
-                import torch
-                for ri, req in enumerate(cache_trans_complete_requests):
-                    if ri >= 4:
-                        break
-                    # Get the state index that was set during _prepare_disagg_gen_init
-                    if hasattr(kv_mgr, 'cuda_state_indices') and hasattr(
-                            kv_mgr, 'requests'):
-                        # Find request index in kv_mgr.requests
-                        req_idx = None
-                        for ki, kr in enumerate(kv_mgr.requests):
-                            if kr.py_request_id == req.py_request_id:
-                                req_idx = ki
-                                break
-                        if req_idx is not None:
-                            idx = kv_mgr.cuda_state_indices[req_idx].item()
-                            ssm = kv_mgr.all_ssm_states[0, idx]
-                            conv = kv_mgr.all_conv_states[0, idx]
-                            ssm_abs = ssm.to(torch.float32).abs().sum().item()
-                            conv_abs = conv.to(torch.float32).abs().sum().item()
-                            logger.info(
-                                f"DISAGG_RECV_VERIFY req[{ri}]: req_idx={req_idx}, "
-                                f"state_idx={idx}, ssm_abs_sum={ssm_abs:.4f}, "
-                                f"conv_abs_sum={conv_abs:.4f}, "
-                                f"ssm_shape={list(ssm.shape)}, "
-                                f"pool_ptr={kv_mgr.all_ssm_states.data_ptr():#x}, "
-                                f"prompt_len={req.prompt_len}")
-
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -3698,29 +3666,6 @@ class PyExecutor:
                 if req.is_context_only_request and (
                         req.is_context_finished or req.is_finished_due_to_length
                 ) and not req.is_finished_due_to_cancellation:
-                    # DIAG: Verify recurrent state pool data before send (ctx side)
-                    kv_mgr = self.resource_manager.resource_managers.get(
-                        ResourceManagerType.KV_CACHE_MANAGER)
-                    if kv_mgr is not None and hasattr(kv_mgr, 'all_ssm_states'):
-                        import torch
-                        if hasattr(kv_mgr, 'cuda_state_indices') and hasattr(
-                                kv_mgr, 'requests'):
-                            for ki, kr in enumerate(kv_mgr.requests):
-                                if kr.py_request_id == req.py_request_id:
-                                    idx = kv_mgr.cuda_state_indices[ki].item()
-                                    ssm = kv_mgr.all_ssm_states[0, idx]
-                                    conv = kv_mgr.all_conv_states[0, idx]
-                                    ssm_abs = ssm.to(
-                                        torch.float32).abs().sum().item()
-                                    conv_abs = conv.to(
-                                        torch.float32).abs().sum().item()
-                                    logger.info(
-                                        f"CTX_SEND_VERIFY: state_idx={idx}, "
-                                        f"ssm_abs_sum={ssm_abs:.4f}, "
-                                        f"conv_abs_sum={conv_abs:.4f}, "
-                                        f"pool_ptr={kv_mgr.all_ssm_states.data_ptr():#x}, "
-                                        f"prompt_len={req.prompt_len}")
-                                    break
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
