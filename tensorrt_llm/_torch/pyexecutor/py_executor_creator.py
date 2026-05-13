@@ -621,9 +621,10 @@ def create_py_executor(
     config = model_engine.model.model_config.pretrained_config
     if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
             cache_transceiver_config is not None
-            and cache_transceiver_config.backend is not None):
+            and cache_transceiver_config.backend is not None
+            and cache_transceiver_config.transceiver_runtime == "PYTHON"):
         logger.warning(
-            "Disabling block reuse for MambaHybridCacheManager-based models when disagg is enabled"
+            "Disabling block reuse for MambaHybridCacheManager-based models when disagg + Python transceiver enabled"
         )
         kv_cache_config.enable_block_reuse = False
         _set_model_engines_cache_reuse([model_engine, draft_model_engine],
