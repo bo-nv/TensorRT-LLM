@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -74,7 +74,9 @@ std::vector<SizeType32> CacheTransferLayer::computeCounterparts(
     auto counterparts
         = executor::kv_cache::targetIRanks(peerState.getCacheState().value(), mCacheState, selfIdx).mIRanks;
 
-    // Add RNN counterparts that are not already in the KV set
+    // Add RNN counterparts that are not already in the KV set.
+    // Separate RnnStateManager may have different sharding — use targetIRanksForRnn.
+    // Unified pool path (CppMambaHybridCacheManager) uses the same ranks as KV — already covered above.
     if (mRnnFormatter && mCacheState.hasRnnConfig() && peerState.getCacheState().value().hasRnnConfig())
     {
         auto rnnCounterparts

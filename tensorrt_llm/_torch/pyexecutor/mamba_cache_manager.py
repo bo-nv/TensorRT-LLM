@@ -968,7 +968,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     C++ KVCacheManager, enabling block reuse / prefix caching across attention
     and mamba layers. This is the default hybrid manager.
 
-    Disaggregated serving is not supported yet.
+    Disaggregated serving is supported via C++ CacheFormatter, which
+    handles recurrent state blocks from the unified pool inline alongside
+    KV cache blocks.
     """
 
     def __init__(
@@ -1285,6 +1287,26 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 # don't care which half of doulbe-buffer is using
                 # self.cache_buf_idx[ctx_slots] = 0
 
+        # DIAG: Verify pool data is non-zero for gen requests (disagg verification)
+        num_gen = len(scheduled_batch.generation_requests)
+        if num_gen > 0 and num_gen <= 4:
+            from tensorrt_llm import logger as _logger
+            num_ctx = len(scheduled_batch.context_requests)
+            for gi, req in enumerate(scheduled_batch.generation_requests):
+                idx = self.cuda_state_indices[num_ctx + gi].item()
+                ssm_slice = self.all_ssm_states[0, idx]  # layer 0
+                conv_slice = self.all_conv_states[0, idx]  # layer 0
+                ssm_abs_sum = ssm_slice.to(torch.float32).abs().sum().item()
+                conv_abs_sum = conv_slice.to(torch.float32).abs().sum().item()
+                ssm_nonzero = (ssm_slice != 0).sum().item()
+                conv_nonzero = (conv_slice != 0).sum().item()
+                _logger.info(
+                    f"POOL_VERIFY gen[{gi}]: state_idx={idx}, "
+                    f"ssm_abs_sum={ssm_abs_sum:.4f}, ssm_nonzero={ssm_nonzero}/{ssm_slice.numel()}, "
+                    f"conv_abs_sum={conv_abs_sum:.4f}, conv_nonzero={conv_nonzero}/{conv_slice.numel()}, "
+                    f"prompt_len={req.prompt_len}, num_tokens={self.get_num_tokens(req)}, "
+                    f"is_ctx_finished={req.is_context_finished}")
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
         self._prepare_resources(scheduled_batch)
@@ -1436,10 +1458,38 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.cuda_state_indices[:len(self.requests)] = host_block_offsets.cuda()
         self._host_state_indices = host_block_offsets.clone()
 
-    def get_state_indices(
-            self,
-            request_ids: Optional[List[int]] = None,
-            is_padding: Optional[List[bool]] = None) -> torch.Tensor:
+        # Build request_id → pool block offset mapping so that
+        # get_state_indices can return indices in arbitrary request order.
+        self._request_id_to_state_index = {}
+        for i, req in enumerate(self.requests):
+            self._request_id_to_state_index[
+                req.py_request_id] = host_block_offsets[i].item()
+
+        # Debug: log state index mapping for first few requests
+        if len(self.requests) > 0 and len(self.requests) <= 4:
+            from tensorrt_llm import logger as _logger
+            for i, req in enumerate(self.requests):
+                _logger.info(
+                    f"_setup_state_indices: req[{i}] req_id={req.py_request_id}, "
+                    f"prompt_len={req.prompt_len}, "
+                    f"is_context_finished={req.is_context_finished}, "
+                    f"block_index={block_indices[i]}, "
+                    f"pool_block_offset={host_block_offsets[i].item()}, "
+                    f"num_tokens={self.get_num_tokens(req)}")
+
+    def get_state_indices(self,
+                          request_ids: Optional[List[int]] = None,
+                          is_padding: Optional[List[bool]] = None) -> list:
+        if request_ids is not None and hasattr(self,
+                                               '_request_id_to_state_index'):
+            # Return indices in the order of the caller's request_ids,
+            # not the internal self.requests order.  This is critical when
+            # the batch is reordered after prepare_resources (e.g. disagg
+            # serving sorts generation_requests by py_batch_idx).
+            return [
+                self._request_id_to_state_index.get(rid, 0)
+                for rid in request_ids
+            ]
         return self.cuda_state_indices
 
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:

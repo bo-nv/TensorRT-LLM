@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,7 +47,7 @@ public:
     /// @brief Constructor.
     /// @param cacheState The cache state (KV, and optionally RNN if hasRnnConfig() is true).
     /// @param kvFormatter The KV cache formatter.
-    /// @param rnnFormatter Optional RNN cache formatter.
+    /// @param rnnFormatter Optional RNN cache formatter (V1, for separate RnnStateManager pool).
     CacheTransferLayer(executor::kv_cache::CacheState cacheState, std::unique_ptr<BaseCacheFormatter> kvFormatter,
         std::unique_ptr<RnnCacheFormatter> rnnFormatter = nullptr);
 

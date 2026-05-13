@@ -204,6 +204,13 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
 
         for (auto const& [windowSize, metadata] : windowsMetadata)
         {
+            // Skip recurrent state windows — their encoded windowSize (0x80000001)
+            // would overflow the arithmetic below.  These blocks are transferred
+            // as-is by sendRecurrentStates / recvRecurrentStates.
+            if (LinearAttentionMetadata::hasRecurrentStatesCache(windowSize))
+            {
+                continue;
+            }
             auto windowStartBlockIdx = needSendAllForWindow
                 ? 0
                 : static_cast<SizeType32>(blockIdsPerWindow.at(windowSize).size())
@@ -286,6 +293,13 @@ BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmReques
 
     for (auto const& [windowSize, metadata] : windowsMetadata)
     {
+        // Skip recurrent state windows — their encoded windowSize (0x80000001) would
+        // overflow the arithmetic below.  These blocks are transferred as-is by
+        // sendRecurrentStates / recvRecurrentStates.
+        if (LinearAttentionMetadata::hasRecurrentStatesCache(windowSize))
+        {
+            continue;
+        }
         auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
         auto windowStartBlockIdx = static_cast<SizeType32>(blockIdsPerWindow.at(windowSize).size())
             - (windowSize / cacheManager->getBlockManager().getTokensPerBlock() + 1);
@@ -380,7 +394,105 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
 
-    bool layerWise = common::getEnvDisaggLayerwise() && numPools == 1;
+    // Filter out recurrent state windows — handled separately below (direct transfer, no head splitting).
+    auto const allWindowSizes = blockRange.getWindowSizes();
+    std::vector<SizeType32> kvWindowSizes;
+    kvWindowSizes.reserve(allWindowSizes.size());
+    for (auto const& ws : allWindowSizes)
+    {
+        if (!LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+        {
+            kvWindowSizes.push_back(ws);
+        }
+    }
+
+    SizeType32 const numKvPools = static_cast<SizeType32>(kvWindowSizes.size());
+
+    TLLM_LOG_INFO("CacheFormatter::format: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%lu",
+        allWindowSizes.size(), numKvPools, numPools, llmRequest.mRequestId);
+
+    // Send recurrent state blocks from the unified KV pool (CppMambaHybridCacheManager path).
+    // Real (non-placeholder) blocks are sent as opaque blobs — no head-based splitting.
+    auto sendRecurrentStates = [&]()
+    {
+        auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+        // Synchronize all CUDA streams before reading recurrent state pool data.
+        // Unlike attention KV which goes through splitKVCacheDispatch (a CUDA kernel that
+        // implicitly syncs with the compute stream via legacy default stream semantics),
+        // recurrent states are sent directly from the pool via RDMA/memcpy with no CUDA
+        // kernel in between. Without this sync, the sender thread may read stale data
+        // written by the compute stream during model forward.
+        bool hasRecurrentWindows = false;
+        for (auto const& ws : allWindowSizes)
+        {
+            if (LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+            {
+                hasRecurrentWindows = true;
+                break;
+            }
+        }
+        if (hasRecurrentWindows)
+        {
+            TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        for (auto const& ws : allWindowSizes)
+        {
+            if (!LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+            {
+                continue;
+            }
+            auto it = blockIdsPerWindow.find(ws);
+            if (it == blockIdsPerWindow.end() || it->second.empty())
+            {
+                continue;
+            }
+            // Find pool for this window size.
+            runtime::ITensor::SharedPtr pool;
+            auto const totalPools = blockManager.getNumPools(false, false);
+            for (SizeType32 poolIdx = 0; poolIdx < totalPools; ++poolIdx)
+            {
+                if (blockManager.getPoolWindowSize(poolIdx) == ws)
+                {
+                    pool = blockManager.getPrimaryPool(poolIdx);
+                    break;
+                }
+            }
+            TLLM_CHECK_WITH_INFO(pool != nullptr, "Could not find pool for recurrent state window");
+
+            // Recurrent state pool uses layer-first layout: {numLayers, numBlocks, kvFactor, blockSize}.
+            // Block data is non-contiguous across layers, so we must iterate per-layer.
+            SizeType32 const numLayers = pool->getShape().d[0];
+            SizeType32 realBlockCount = 0;
+            size_t totalBytesSent = 0;
+            for (auto const& blockId : it->second)
+            {
+                auto const& block = blockManager.getBlockById(blockId, ws);
+                if (block->isPlaceholder())
+                {
+                    continue;
+                }
+                ++realBlockCount;
+                auto const blockIdx = static_cast<runtime::ITensor::DimType64>(block->getMemoryPoolBlockIndex());
+                for (SizeType32 layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+                {
+                    // slice at {layerIdx, blockIdx} gives shape {1, kvFactor, blockSize}
+                    auto blockTensor = runtime::ITensor::slice(pool, {layerIdx, blockIdx}, 1);
+                    for (size_t i = 0; i < pickUpConnections.size(); i++)
+                    {
+                        totalBytesSent += blockTensor->getSizeInBytes();
+                        session.send(pickUpConnections[i], blockTensor->data(), blockTensor->getSizeInBytes());
+                    }
+                }
+            }
+            TLLM_LOG_INFO(
+                "sendRecurrentStates: windowSize=0x%x, totalBlockIds=%zu, realBlocks=%d, numLayers=%d, "
+                "totalBytesSent=%zu, poolShape=%s, requestId=%lu",
+                ws, it->second.size(), realBlockCount, numLayers, totalBytesSent,
+                runtime::ITensor::toString(pool->getShape()).c_str(), llmRequest.mRequestId);
+        }
+    };
+
+    bool layerWise = common::getEnvDisaggLayerwise() && numKvPools == 1;
     if (layerWise)
     {
         auto& progress = llmRequest.getContextProgress();
@@ -395,8 +507,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             {
                 progress->wait(layerIdx);
             }
-            auto const& windowSizes = blockRange.getWindowSizes();
-            for (auto const& windowSize : windowSizes)
+            for (auto const& windowSize : kvWindowSizes)
             {
                 auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
                 for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
@@ -422,15 +533,14 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         int blockNum = 0;
 
         size_t allCacheBlockSize = 0;
-        auto const& windowSizes = blockRange.getWindowSizes();
         TLLM_LOG_DEBUG(
-            mpi::MpiComm::world().getRank(), " blockRange.getWindowSizes(); windowSizes size: %d", windowSizes.size());
-        TLLM_CHECK_WITH_INFO(
-            static_cast<int>(windowSizes.size()) == numPools, "window sizes should be the same as numPools");
+            mpi::MpiComm::world().getRank(), " kvWindowSizes size: %d, numPools: %d", kvWindowSizes.size(), numPools);
+        // When recurrent state windows are present (unified pool), numKvPools < numPools.
+        TLLM_CHECK_WITH_INFO(numKvPools <= numPools, "KV window sizes should not exceed numPools");
 
         std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocksPerWindow;
 
-        for (auto const& windowSize : windowSizes)
+        for (auto const& windowSize : kvWindowSizes)
         {
             auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " format  windowSize: %d blockRangeForWindow size: %d",
@@ -443,8 +553,9 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 blockNum++;
             }
         }
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "inputKvCacheBlocks size: %ld,blockNum: %d , windowSizes: %ld",
-            inputKvCacheBlocksPerWindow.size(), blockNum, windowSizes.size());
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+            "inputKvCacheBlocks size: %ld,blockNum: %d , kvWindowSizes: %ld", inputKvCacheBlocksPerWindow.size(),
+            blockNum, kvWindowSizes.size());
 
         if (inputKvCacheBlocksPerWindow.size() > 1)
         {
@@ -480,6 +591,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                     }
                 }
             }
+            sendRecurrentStates();
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
                 llmRequest.mRequestId);
 
@@ -581,6 +693,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
         session.setTime(TransferSession::kTimePostprocess);
     }
+    sendRecurrentStates();
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
 }
@@ -622,9 +735,95 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     size_t blockNum = 0;
     size_t cacheBlockSizeSum = 0;
 
-    auto windowSizes = blockRange.getWindowSizes();
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " unformat windowSizes size: %d", windowSizes.size());
-    for (auto const& windowSize : windowSizes)
+    // Filter out recurrent state windows — handled separately below (direct transfer, no head splitting).
+    auto const allWindowSizes = blockRange.getWindowSizes();
+    std::vector<SizeType32> kvWindowSizes;
+    kvWindowSizes.reserve(allWindowSizes.size());
+    for (auto const& ws : allWindowSizes)
+    {
+        if (!LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+        {
+            kvWindowSizes.push_back(ws);
+        }
+    }
+    SizeType32 const numKvPools = static_cast<SizeType32>(kvWindowSizes.size());
+
+    TLLM_LOG_INFO("CacheFormatter::unformat: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%lu",
+        allWindowSizes.size(), numKvPools, numPools, llmRequest.mRequestId);
+
+    // Receive recurrent state blocks into the unified KV pool (CppMambaHybridCacheManager path).
+    // Real (non-placeholder) blocks are received as opaque blobs — no concat needed.
+    auto& recvBlockManager = mCacheManager->getBlockManager();
+    auto recvRecurrentStates = [&]()
+    {
+        auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+        for (auto const& ws : allWindowSizes)
+        {
+            if (!LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+            {
+                continue;
+            }
+            auto it = blockIdsPerWindow.find(ws);
+            if (it == blockIdsPerWindow.end() || it->second.empty())
+            {
+                continue;
+            }
+            // Find pool for this window size.
+            runtime::ITensor::SharedPtr pool;
+            auto const totalPools = recvBlockManager.getNumPools(false, false);
+            for (SizeType32 poolIdx = 0; poolIdx < totalPools; ++poolIdx)
+            {
+                if (recvBlockManager.getPoolWindowSize(poolIdx) == ws)
+                {
+                    pool = recvBlockManager.getPrimaryPool(poolIdx);
+                    break;
+                }
+            }
+            TLLM_CHECK_WITH_INFO(pool != nullptr, "Could not find pool for recurrent state window");
+
+            // Recurrent state pool uses layer-first layout: {numLayers, numBlocks, kvFactor, blockSize}.
+            // Block data is non-contiguous across layers, so we must iterate per-layer
+            // (matching the send side order).
+            SizeType32 const numLayers = pool->getShape().d[0];
+            SizeType32 realBlockCount = 0;
+            size_t totalBytesRecv = 0;
+            for (auto const& blockId : it->second)
+            {
+                auto const& block = recvBlockManager.getBlockById(blockId, ws);
+                if (block->isPlaceholder())
+                {
+                    continue;
+                }
+                ++realBlockCount;
+                auto const blockIdx = static_cast<runtime::ITensor::DimType64>(block->getMemoryPoolBlockIndex());
+                TLLM_LOG_INFO(
+                    "recvRecurrentStates DIAG: blockId=%d, memPoolIdx=%lld, numLayers=%d, bytesPerLayer=%zu, "
+                    "poolPtr=%p, requestId=%lu",
+                    blockId, blockIdx, numLayers,
+                    numLayers > 0 ? runtime::ITensor::slice(pool, {0, blockIdx}, 1)->getSizeInBytes() : 0, pool->data(),
+                    llmRequest.mRequestId);
+                for (SizeType32 layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+                {
+                    // slice at {layerIdx, blockIdx} gives shape {1, kvFactor, blockSize}
+                    auto blockTensor = runtime::ITensor::slice(pool, {layerIdx, blockIdx}, 1);
+                    for (size_t i = 0; i < pickUpConnections.size(); i++)
+                    {
+                        totalBytesRecv += blockTensor->getSizeInBytes();
+                        llmRequest.updateKvCacheSize(blockTensor->getSizeInBytes());
+                        session.recv(pickUpConnections[i], blockTensor->data(), blockTensor->getSizeInBytes());
+                    }
+                }
+            }
+            TLLM_LOG_INFO(
+                "recvRecurrentStates: windowSize=0x%x, totalBlockIds=%zu, realBlocks=%d, numLayers=%d, "
+                "totalBytesRecv=%zu, poolShape=%s, requestId=%lu",
+                ws, it->second.size(), realBlockCount, numLayers, totalBytesRecv,
+                runtime::ITensor::toString(pool->getShape()).c_str(), llmRequest.mRequestId);
+        }
+    };
+
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " unformat kvWindowSizes size: %d", kvWindowSizes.size());
+    for (auto const& windowSize : kvWindowSizes)
     {
         auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "  unformat windowSize: %d blockRangeForWindow size: %d",
@@ -638,8 +837,9 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             blockNum++;
         }
     }
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "outputBuffersPerWindow size: %ld,blockNum: %d , windowSizes: %ld",
-        outputBuffersPerWindow.size(), blockNum, windowSizes.size());
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "outputBuffersPerWindow size: %ld,blockNum: %d , kvWindowSizes: %ld", outputBuffersPerWindow.size(), blockNum,
+        kvWindowSizes.size());
     TLLM_CHECK(!outputBuffersPerWindow.empty());
     if (outputBuffersPerWindow.size() > 1)
     {
@@ -653,7 +853,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         NVTX3_SCOPED_RANGE(formatInputRecvBuffer);
 
         auto dataType = mCacheManager->getPrimaryPool(0)->getDataType();
-        bool layerWise = common::getEnvDisaggLayerwise() && numPools == 1;
+        bool layerWise = common::getEnvDisaggLayerwise() && numKvPools == 1;
         if (layerWise)
         {
             // [numLayersInPool, ...]
@@ -737,6 +937,28 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                             llmRequest.updateKvCacheSize((*block).getSizeInBytes());
                             session.recv(pickUpConnections[i], block->data(), block->getSizeInBytes());
                         }
+                    }
+                }
+                recvRecurrentStates();
+                // Sync after receiving recurrent states — see comment at end of unformat().
+                {
+                    bool hasRecurrentWindows = false;
+                    auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+                    for (auto const& ws : allWindowSizes)
+                    {
+                        if (LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+                        {
+                            auto it2 = blockIdsPerWindow.find(ws);
+                            if (it2 != blockIdsPerWindow.end() && !it2->second.empty())
+                            {
+                                hasRecurrentWindows = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (hasRecurrentWindows)
+                    {
+                        TLLM_CUDA_CHECK(cudaDeviceSynchronize());
                     }
                 }
                 TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
@@ -957,6 +1179,31 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         }
     }
 
+    recvRecurrentStates();
+    // Ensure recurrent state data received via RDMA/network is visible to the compute stream.
+    // The model forward will read these states on the default compute stream; without this
+    // sync, GPU caches may serve stale data.
+    {
+        bool hasRecurrentWindows = false;
+        auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+        for (auto const& ws : allWindowSizes)
+        {
+            if (LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+            {
+                auto it = blockIdsPerWindow.find(ws);
+                if (it != blockIdsPerWindow.end() && !it->second.empty())
+                {
+                    hasRecurrentWindows = true;
+                    break;
+                }
+            }
+        }
+        if (hasRecurrentWindows)
+        {
+            TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+        }
+    }
+
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "End receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
         llmRequest.getContextPhaseParams().value().getReqId());
@@ -970,8 +1217,17 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         return false;
     }
 
-    std::unordered_set<SizeType32> setVecSelf{
-        selfConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), selfConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
+    // Collect unique non-zero KV head counts.  Hybrid models (CppMambaHybridCacheManager)
+    // include mamba/recurrent state layers with 0 KV heads — those must be excluded from
+    // the uniformity check which only applies to attention layers.
+    std::unordered_set<SizeType32> setVecSelf;
+    for (auto h : selfConfig.getModelConfig().mNbKvHeadsPerLayer)
+    {
+        if (h > 0)
+        {
+            setVecSelf.insert(h);
+        }
+    }
 
     if (setVecSelf.size() != 1)
     {
@@ -1002,8 +1258,14 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         return false;
     }
 
-    std::unordered_set<int> setVecDest{
-        destConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), destConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
+    std::unordered_set<SizeType32> setVecDest;
+    for (auto h : destConfig.getModelConfig().mNbKvHeadsPerLayer)
+    {
+        if (h > 0)
+        {
+            setVecDest.insert(h);
+        }
+    }
 
     if (setVecDest.size() != 1)
     {

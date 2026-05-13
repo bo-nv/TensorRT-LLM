@@ -75,9 +75,12 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
     """Resolve the concrete KV cache manager class for ``model_config``.
 
     For hybrid mamba models the choice between ``Mixed`` (separate pools,
-    needed for disagg / TRTLLM_USE_CPP_MAMBA) and ``Cpp`` (unified pool with
-    block reuse) is made here. Callers that don't care about disagg can omit
-    ``is_disagg`` and get the unified-pool default.
+    needed for TRTLLM_USE_CPP_MAMBA legacy path) and ``Cpp`` (unified pool
+    with block reuse, supports disagg) is made here.
+
+    ``is_disagg`` is accepted for backward compatibility but no longer
+    affects the choice — ``CppMambaHybridCacheManager`` now supports
+    disaggregated serving via C++ ``CacheFormatter`` (recurrent states handled inline).
     """
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
@@ -90,7 +93,7 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
             logger.info("Hybrid linear model has 0 mamba layers; using "
                         "KVCacheManager without mamba caching")
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
-        if is_disagg or use_cpp_mamba_cache_manager():
+        if use_cpp_mamba_cache_manager():
             return MixedMambaHybridCacheManager
         return CppMambaHybridCacheManager
     else:
@@ -242,12 +245,13 @@ class KvCacheCreator:
         # users see the warning where the decision is actually made.
         if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
                 and self._kv_cache_config.enable_block_reuse:
-            uses_v1_mamba_route = self._is_disagg \
-                or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
+            uses_v1_mamba_route = \
+                os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
                 or self._speculative_config is not None
             if uses_v1_mamba_route:
                 logger.warning(
-                    "Block reuse does not work with MTP or disagg for hybrid linear models"
+                    "Block reuse does not work with MTP for hybrid linear models "
+                    "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
                 )
         return cls
 
