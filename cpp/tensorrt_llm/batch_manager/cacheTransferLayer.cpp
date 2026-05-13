@@ -49,9 +49,13 @@ void CacheTransferLayer::validateSupport(executor::DataTransceiverState const& p
         "Disagg server does not currently support these cacheState, please check the cacheState of the context and "
         "gen executors");
 
-    if (mRnnFormatter && mCacheState.hasRnnConfig())
+    bool const selfHasRnn = mCacheState.hasRnnConfig();
+    bool const peerHasRnn = peerState.getCacheState().value().hasRnnConfig();
+
+    if (mRnnFormatter && selfHasRnn)
     {
-        if (peerState.getCacheState().value().hasRnnConfig())
+        // Separate RnnStateManager path (CppMambaCacheManager)
+        if (peerHasRnn)
         {
             TLLM_CHECK_WITH_INFO(mRnnFormatter->inquireSupport(mCacheState, peerState.getCacheState().value()),
                 "Disagg server does not currently support these RNN state configurations, please check the RNN "
@@ -62,8 +66,11 @@ void CacheTransferLayer::validateSupport(executor::DataTransceiverState const& p
             TLLM_LOG_WARNING("Self has RNN state but peer does not. RNN transfer will be skipped.");
         }
     }
-    else if (peerState.getCacheState().value().hasRnnConfig() && (!mRnnFormatter || !mCacheState.hasRnnConfig()))
+    else if (!selfHasRnn && peerHasRnn)
     {
+        // Self truly has no RNN config at all — warn.
+        // Note: unified pool path (CppMambaHybridCacheManager) has selfHasRnn=true
+        // and mRnnFormatter=nullptr, which is handled by CacheFormatter internally.
         TLLM_LOG_WARNING("Peer has RNN state but self does not. RNN transfer will be skipped.");
     }
 }
@@ -116,6 +123,13 @@ void CacheTransferLayer::unformat(TransferSession& session) const
     {
         mRnnFormatter->unformat(session);
     }
+}
+
+void CacheTransferLayer::setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+    std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType, nvinfer1::DataType ssmStateDataType)
+{
+    mCacheState.setRnnConfig(
+        std::move(rnnModelConfig), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType);
 }
 
 executor::kv_cache::CacheState const& CacheTransferLayer::getCacheState() const noexcept

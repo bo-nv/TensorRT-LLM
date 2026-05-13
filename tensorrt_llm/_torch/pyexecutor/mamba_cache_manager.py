@@ -1002,6 +1002,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         layer_mask: Optional[List[bool]] = None,
         is_estimating_kv_cache: bool = False,
         use_replay_state_update: bool = False,
+        model_type: str = "nemotron_hybrid",
         **kwargs,
     ) -> None:
         self._use_replay_state_update = use_replay_state_update
@@ -1022,6 +1023,24 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
         self.ssm_state_dtype = mamba_ssm_cache_dtype
         self.conv_state_dtype = mamba_cache_dtype
+
+        # Store GLOBAL (pre-TP-division) mamba params for disagg RnnModelConfig.
+        # d_inner is computed at the top of __init__ before TP division.
+        d_inner_global = d_inner  # = mamba_head_dim * mamba_num_heads (GLOBAL)
+        conv_dim_global = d_inner_global + 2 * mamba_n_groups * mamba_d_state
+        self._rnn_d_state = mamba_d_state
+        self._rnn_d_conv = mamba_d_conv
+        self._rnn_num_heads = mamba_num_heads  # GLOBAL
+        self._rnn_n_groups = mamba_n_groups
+        self._rnn_head_dim = mamba_head_dim
+        self._rnn_hidden_size = d_inner_global  # GLOBAL = head_dim * num_heads
+        self._rnn_conv_dim_size = conv_dim_global  # GLOBAL conv dim
+        self._rnn_num_layers = mamba_num_layers
+
+        # Conv section layout for section-aware split/concat in TP mismatch.
+        # Section dims are derived from mHiddenSize and mNGroups*mDState in C++;
+        # we just need to tell C++ which ordering to use.
+        self._rnn_conv_section_layout = model_type  # "nemotron_hybrid" or "qwen3_next"
         self.ssm_count = math.prod(self.ssm_state_shape)
         self.conv_count = math.prod(self.conv_state_shape)
         self.ssm_bytes = self.ssm_count * self.ssm_state_dtype.itemsize

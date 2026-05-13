@@ -412,7 +412,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         allWindowSizes.size(), numKvPools, numPools, llmRequest.mRequestId);
 
     // Send recurrent state blocks from the unified KV pool (CppMambaHybridCacheManager path).
-    // Real (non-placeholder) blocks are sent as opaque blobs — no head-based splitting.
+    // When self and dest have matching TP, blocks are sent as opaque blobs (no splitting).
+    // When TP differs, use split kernels to redistribute SSM/conv data per target rank.
     auto sendRecurrentStates = [&]()
     {
         auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
@@ -435,6 +436,15 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         {
             TLLM_CUDA_CHECK(cudaDeviceSynchronize());
         }
+
+        bool const tpMismatch
+            = selfConfig.getParallelConfig().mTensorParallelism != destConfig.getParallelConfig().mTensorParallelism;
+
+        TLLM_LOG_INFO("sendRecurrentStates: tpMismatch=%d, selfTP=%d, destTP=%d, hasRnnConfig=%d, requestId=%lu",
+            tpMismatch ? 1 : 0, selfConfig.getParallelConfig().mTensorParallelism,
+            destConfig.getParallelConfig().mTensorParallelism, selfConfig.hasRnnConfig() ? 1 : 0,
+            llmRequest.mRequestId);
+
         for (auto const& ws : allWindowSizes)
         {
             if (!LinearAttentionMetadata::hasRecurrentStatesCache(ws))
@@ -460,35 +470,143 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             TLLM_CHECK_WITH_INFO(pool != nullptr, "Could not find pool for recurrent state window");
 
             // Recurrent state pool uses layer-first layout: {numLayers, numBlocks, kvFactor, blockSize}.
-            // Block data is non-contiguous across layers, so we must iterate per-layer.
             SizeType32 const numLayers = pool->getShape().d[0];
-            SizeType32 realBlockCount = 0;
-            size_t totalBytesSent = 0;
-            for (auto const& blockId : it->second)
+
+            if (!tpMismatch || !selfConfig.hasRnnConfig())
             {
-                auto const& block = blockManager.getBlockById(blockId, ws);
-                if (block->isPlaceholder())
+                // Same TP topology: send as opaque blobs (existing path).
+                SizeType32 realBlockCount = 0;
+                size_t totalBytesSent = 0;
+                for (auto const& blockId : it->second)
+                {
+                    auto const& block = blockManager.getBlockById(blockId, ws);
+                    if (block->isPlaceholder())
+                    {
+                        continue;
+                    }
+                    ++realBlockCount;
+                    auto const blockIdx = static_cast<runtime::ITensor::DimType64>(block->getMemoryPoolBlockIndex());
+                    for (SizeType32 layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+                    {
+                        auto blockTensor = runtime::ITensor::slice(pool, {layerIdx, blockIdx}, 1);
+                        for (size_t i = 0; i < pickUpConnections.size(); i++)
+                        {
+                            totalBytesSent += blockTensor->getSizeInBytes();
+                            session.send(pickUpConnections[i], blockTensor->data(), blockTensor->getSizeInBytes());
+                        }
+                    }
+                }
+                TLLM_LOG_INFO(
+                    "sendRecurrentStates (same-TP): windowSize=0x%x, totalBlockIds=%zu, realBlocks=%d, numLayers=%d, "
+                    "totalBytesSent=%zu, poolShape=%s, requestId=%lu",
+                    ws, it->second.size(), realBlockCount, numLayers, totalBytesSent,
+                    runtime::ITensor::toString(pool->getShape()).c_str(), llmRequest.mRequestId);
+            }
+            else
+            {
+                // TP mismatch: use split kernels.
+                auto const& rnnState = selfConfig.getRnnCacheState();
+                auto const& rnnModel = rnnState.mModelConfig;
+                auto const selfTPNum = selfConfig.getParallelConfig().mTensorParallelism;
+                auto const selfDPSize = selfConfig.getParallelConfig().mDPsize;
+                auto const selfTPPerDP
+                    = selfConfig.getParallelConfig().mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
+
+                // Compute SSM and conv byte sizes from model config
+                int const numHeadsLocal = rnnModel.mNumHeads / selfTPPerDP;
+                size_t const ssmElements = static_cast<size_t>(numHeadsLocal) * rnnModel.mHeadDim * rnnModel.mDState;
+                size_t const ssmBytes = ssmElements * tensorrt_llm::common::getDTypeSize(rnnState.mSsmStateDataType);
+
+                int convDimLocal = 0;
+                auto const globalSectionDims = rnnModel.getConvSectionDims();
+                for (int s = 0; s < executor::kv_cache::CacheState::RnnModelConfig::kNumConvSections; ++s)
+                {
+                    convDimLocal += globalSectionDims[s] / selfTPPerDP;
+                }
+                size_t const convElements = static_cast<size_t>(convDimLocal) * (rnnModel.mDConv - 1);
+                size_t const convBytes = convElements * tensorrt_llm::common::getDTypeSize(rnnState.mConvStateDataType);
+                size_t const blockSizeBytes = ssmBytes + convBytes;
+
+                // Collect real block indices
+                std::vector<SizeType32> realBlockIndices;
+                for (auto const& blockId : it->second)
+                {
+                    auto const& block = blockManager.getBlockById(blockId, ws);
+                    if (!block->isPlaceholder())
+                    {
+                        realBlockIndices.push_back(static_cast<SizeType32>(block->getMemoryPoolBlockIndex()));
+                    }
+                }
+
+                if (realBlockIndices.empty())
                 {
                     continue;
                 }
-                ++realBlockCount;
-                auto const blockIdx = static_cast<runtime::ITensor::DimType64>(block->getMemoryPoolBlockIndex());
-                for (SizeType32 layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+
+                // Compute target rank info for buffer allocation
+                auto targetRankInfo = executor::kv_cache::targetIRanksForRnn(destConfig, selfConfig, selfIdx);
+                auto const numTargets = targetRankInfo.mIRanks.size() / targetRankInfo.mPeerDupHeadFactor;
+
+                // Allocate output SSM buffers per target
+                // Each target gets: numBlocks * layersInPP * headsPerDomainTP * headDim * dState
+                int const headNumDomainTP
+                    = numHeadsLocal / (targetRankInfo.mDomainTPSize / targetRankInfo.mPeerDupHeadFactor);
+                std::vector<runtime::ITensor::SharedPtr> ssmOutputBuffers(numTargets);
+                for (size_t t = 0; t < numTargets; ++t)
                 {
-                    // slice at {layerIdx, blockIdx} gives shape {1, kvFactor, blockSize}
-                    auto blockTensor = runtime::ITensor::slice(pool, {layerIdx, blockIdx}, 1);
-                    for (size_t i = 0; i < pickUpConnections.size(); i++)
-                    {
-                        totalBytesSent += blockTensor->getSizeInBytes();
-                        session.send(pickUpConnections[i], blockTensor->data(), blockTensor->getSizeInBytes());
-                    }
+                    SizeType32 layersForTarget = targetRankInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(t));
+                    size_t ssmBufBytes = realBlockIndices.size() * layersForTarget * headNumDomainTP * rnnModel.mHeadDim
+                        * rnnModel.mDState * tensorrt_llm::common::getDTypeSize(rnnState.mSsmStateDataType);
+                    ssmOutputBuffers[t] = bufferManager.gpu(
+                        runtime::ITensor::makeShape({static_cast<int64_t>(ssmBufBytes)}), nvinfer1::DataType::kUINT8);
                 }
+
+                // Allocate output conv buffers per target
+                int convDimDomainTPTotal = 0;
+                for (int s = 0; s < executor::kv_cache::CacheState::RnnModelConfig::kNumConvSections; ++s)
+                {
+                    int sectionLocal = globalSectionDims[s] / selfTPPerDP;
+                    convDimDomainTPTotal
+                        += sectionLocal / (targetRankInfo.mDomainTPSize / targetRankInfo.mPeerDupHeadFactor);
+                }
+                std::vector<runtime::ITensor::SharedPtr> convOutputBuffers(numTargets);
+                for (size_t t = 0; t < numTargets; ++t)
+                {
+                    SizeType32 layersForTarget = targetRankInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(t));
+                    size_t convBufBytes = realBlockIndices.size() * layersForTarget * convDimDomainTPTotal
+                        * (rnnModel.mDConv - 1) * tensorrt_llm::common::getDTypeSize(rnnState.mConvStateDataType);
+                    convOutputBuffers[t] = bufferManager.gpu(
+                        runtime::ITensor::makeShape({static_cast<int64_t>(convBufBytes)}), nvinfer1::DataType::kUINT8);
+                }
+
+                // Run split kernels
+                executor::rnn_cache::splitUnifiedPoolSsmDispatch(pool, realBlockIndices, ssmOutputBuffers, destConfig,
+                    selfConfig, selfIdx, ssmBytes, blockSizeBytes, rnnState.mSsmStateDataType, bufferManager);
+                executor::rnn_cache::splitUnifiedPoolConvDispatch(pool, realBlockIndices, convOutputBuffers, destConfig,
+                    selfConfig, selfIdx, ssmBytes, blockSizeBytes, rnnState.mConvStateDataType, bufferManager);
+
+                // Sync after split kernels before sending
+                bufferManager.getStream().synchronize();
+
+                // Send split buffers: SSM then conv for each target
+                size_t totalBytesSent = 0;
+                for (size_t t = 0; t < numTargets; ++t)
+                {
+                    size_t connIdx = t % pickUpConnections.size();
+                    totalBytesSent += ssmOutputBuffers[t]->getSizeInBytes();
+                    session.send(
+                        pickUpConnections[connIdx], ssmOutputBuffers[t]->data(), ssmOutputBuffers[t]->getSizeInBytes());
+                    totalBytesSent += convOutputBuffers[t]->getSizeInBytes();
+                    session.send(pickUpConnections[connIdx], convOutputBuffers[t]->data(),
+                        convOutputBuffers[t]->getSizeInBytes());
+                }
+
+                TLLM_LOG_INFO(
+                    "sendRecurrentStates (TP-mismatch split): windowSize=0x%x, realBlocks=%zu, numTargets=%zu, "
+                    "totalBytesSent=%zu, ssmBytes=%zu, convBytes=%zu, requestId=%lu",
+                    ws, realBlockIndices.size(), numTargets, totalBytesSent, ssmBytes, convBytes,
+                    llmRequest.mRequestId);
             }
-            TLLM_LOG_INFO(
-                "sendRecurrentStates: windowSize=0x%x, totalBlockIds=%zu, realBlocks=%d, numLayers=%d, "
-                "totalBytesSent=%zu, poolShape=%s, requestId=%lu",
-                ws, it->second.size(), realBlockCount, numLayers, totalBytesSent,
-                runtime::ITensor::toString(pool->getShape()).c_str(), llmRequest.mRequestId);
         }
     };
 
@@ -752,11 +870,21 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         allWindowSizes.size(), numKvPools, numPools, llmRequest.mRequestId);
 
     // Receive recurrent state blocks into the unified KV pool (CppMambaHybridCacheManager path).
-    // Real (non-placeholder) blocks are received as opaque blobs — no concat needed.
+    // When self and src have matching TP, blocks are received as opaque blobs (no concat needed).
+    // When TP differs, receive split buffers and concat into the local pool.
     auto& recvBlockManager = mCacheManager->getBlockManager();
     auto recvRecurrentStates = [&]()
     {
         auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+
+        bool const tpMismatch
+            = selfConfig.getParallelConfig().mTensorParallelism != destConfig.getParallelConfig().mTensorParallelism;
+
+        TLLM_LOG_INFO("recvRecurrentStates: tpMismatch=%d, selfTP=%d, destTP=%d, hasRnnConfig=%d, requestId=%lu",
+            tpMismatch ? 1 : 0, selfConfig.getParallelConfig().mTensorParallelism,
+            destConfig.getParallelConfig().mTensorParallelism, selfConfig.hasRnnConfig() ? 1 : 0,
+            llmRequest.mRequestId);
+
         for (auto const& ws : allWindowSizes)
         {
             if (!LinearAttentionMetadata::hasRecurrentStatesCache(ws))
@@ -781,44 +909,138 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             }
             TLLM_CHECK_WITH_INFO(pool != nullptr, "Could not find pool for recurrent state window");
 
-            // Recurrent state pool uses layer-first layout: {numLayers, numBlocks, kvFactor, blockSize}.
-            // Block data is non-contiguous across layers, so we must iterate per-layer
-            // (matching the send side order).
             SizeType32 const numLayers = pool->getShape().d[0];
-            SizeType32 realBlockCount = 0;
-            size_t totalBytesRecv = 0;
-            for (auto const& blockId : it->second)
+
+            if (!tpMismatch || !selfConfig.hasRnnConfig())
             {
-                auto const& block = recvBlockManager.getBlockById(blockId, ws);
-                if (block->isPlaceholder())
+                // Same TP topology: receive as opaque blobs (existing path).
+                SizeType32 realBlockCount = 0;
+                size_t totalBytesRecv = 0;
+                for (auto const& blockId : it->second)
+                {
+                    auto const& block = recvBlockManager.getBlockById(blockId, ws);
+                    if (block->isPlaceholder())
+                    {
+                        continue;
+                    }
+                    ++realBlockCount;
+                    auto const blockIdx = static_cast<runtime::ITensor::DimType64>(block->getMemoryPoolBlockIndex());
+                    TLLM_LOG_INFO(
+                        "recvRecurrentStates DIAG: blockId=%d, memPoolIdx=%lld, numLayers=%d, bytesPerLayer=%zu, "
+                        "poolPtr=%p, requestId=%lu",
+                        blockId, blockIdx, numLayers,
+                        numLayers > 0 ? runtime::ITensor::slice(pool, {0, blockIdx}, 1)->getSizeInBytes() : 0,
+                        pool->data(), llmRequest.mRequestId);
+                    for (SizeType32 layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+                    {
+                        auto blockTensor = runtime::ITensor::slice(pool, {layerIdx, blockIdx}, 1);
+                        for (size_t i = 0; i < pickUpConnections.size(); i++)
+                        {
+                            totalBytesRecv += blockTensor->getSizeInBytes();
+                            llmRequest.updateKvCacheSize(blockTensor->getSizeInBytes());
+                            session.recv(pickUpConnections[i], blockTensor->data(), blockTensor->getSizeInBytes());
+                        }
+                    }
+                }
+                TLLM_LOG_INFO(
+                    "recvRecurrentStates (same-TP): windowSize=0x%x, totalBlockIds=%zu, realBlocks=%d, numLayers=%d, "
+                    "totalBytesRecv=%zu, poolShape=%s, requestId=%lu",
+                    ws, it->second.size(), realBlockCount, numLayers, totalBytesRecv,
+                    runtime::ITensor::toString(pool->getShape()).c_str(), llmRequest.mRequestId);
+            }
+            else
+            {
+                // TP mismatch: receive split buffers and concat into pool.
+                auto const& rnnState = selfConfig.getRnnCacheState();
+                auto const& rnnModel = rnnState.mModelConfig;
+                auto const selfTPNum = selfConfig.getParallelConfig().mTensorParallelism;
+                auto const selfDPSize = selfConfig.getParallelConfig().mDPsize;
+                auto const selfTPPerDP
+                    = selfConfig.getParallelConfig().mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
+
+                int const numHeadsLocal = rnnModel.mNumHeads / selfTPPerDP;
+                size_t const ssmElements = static_cast<size_t>(numHeadsLocal) * rnnModel.mHeadDim * rnnModel.mDState;
+                size_t const ssmBytes = ssmElements * tensorrt_llm::common::getDTypeSize(rnnState.mSsmStateDataType);
+
+                int convDimLocal = 0;
+                auto const globalSectionDims = rnnModel.getConvSectionDims();
+                for (int s = 0; s < executor::kv_cache::CacheState::RnnModelConfig::kNumConvSections; ++s)
+                {
+                    convDimLocal += globalSectionDims[s] / selfTPPerDP;
+                }
+                size_t const convElements = static_cast<size_t>(convDimLocal) * (rnnModel.mDConv - 1);
+                size_t const convBytes = convElements * tensorrt_llm::common::getDTypeSize(rnnState.mConvStateDataType);
+                size_t const blockSizeBytes = ssmBytes + convBytes;
+
+                // Collect real block indices
+                std::vector<SizeType32> realBlockIndices;
+                for (auto const& blockId : it->second)
+                {
+                    auto const& block = recvBlockManager.getBlockById(blockId, ws);
+                    if (!block->isPlaceholder())
+                    {
+                        realBlockIndices.push_back(static_cast<SizeType32>(block->getMemoryPoolBlockIndex()));
+                    }
+                }
+
+                if (realBlockIndices.empty())
                 {
                     continue;
                 }
-                ++realBlockCount;
-                auto const blockIdx = static_cast<runtime::ITensor::DimType64>(block->getMemoryPoolBlockIndex());
-                TLLM_LOG_INFO(
-                    "recvRecurrentStates DIAG: blockId=%d, memPoolIdx=%lld, numLayers=%d, bytesPerLayer=%zu, "
-                    "poolPtr=%p, requestId=%lu",
-                    blockId, blockIdx, numLayers,
-                    numLayers > 0 ? runtime::ITensor::slice(pool, {0, blockIdx}, 1)->getSizeInBytes() : 0, pool->data(),
-                    llmRequest.mRequestId);
-                for (SizeType32 layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+
+                // Compute source target rank info (src = destConfig, self = selfConfig)
+                auto targetRankInfo = executor::kv_cache::targetIRanksForRnn(destConfig, selfConfig, selfIdx);
+                auto const numSources = targetRankInfo.mIRanks.size() / targetRankInfo.mPeerDupHeadFactor;
+
+                // Compute per-source buffer sizes (matching what the sender split produced)
+                int const headNumDomainTP
+                    = numHeadsLocal / (targetRankInfo.mDomainTPSize / targetRankInfo.mPeerDupHeadFactor);
+                int convDimDomainTPTotal = 0;
+                for (int s = 0; s < executor::kv_cache::CacheState::RnnModelConfig::kNumConvSections; ++s)
                 {
-                    // slice at {layerIdx, blockIdx} gives shape {1, kvFactor, blockSize}
-                    auto blockTensor = runtime::ITensor::slice(pool, {layerIdx, blockIdx}, 1);
-                    for (size_t i = 0; i < pickUpConnections.size(); i++)
-                    {
-                        totalBytesRecv += blockTensor->getSizeInBytes();
-                        llmRequest.updateKvCacheSize(blockTensor->getSizeInBytes());
-                        session.recv(pickUpConnections[i], blockTensor->data(), blockTensor->getSizeInBytes());
-                    }
+                    int sectionLocal = globalSectionDims[s] / selfTPPerDP;
+                    convDimDomainTPTotal
+                        += sectionLocal / (targetRankInfo.mDomainTPSize / targetRankInfo.mPeerDupHeadFactor);
                 }
+
+                // Allocate and receive SSM buffers from each source
+                std::vector<runtime::ITensor::SharedPtr> ssmInputBuffers(numSources);
+                std::vector<runtime::ITensor::SharedPtr> convInputBuffers(numSources);
+                size_t totalBytesRecv = 0;
+                for (size_t t = 0; t < numSources; ++t)
+                {
+                    SizeType32 layersFromSource = targetRankInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(t));
+                    size_t ssmBufBytes = realBlockIndices.size() * layersFromSource * headNumDomainTP
+                        * rnnModel.mHeadDim * rnnModel.mDState
+                        * tensorrt_llm::common::getDTypeSize(rnnState.mSsmStateDataType);
+                    ssmInputBuffers[t] = bufferManager.gpu(
+                        runtime::ITensor::makeShape({static_cast<int64_t>(ssmBufBytes)}), nvinfer1::DataType::kUINT8);
+
+                    size_t convBufBytes = realBlockIndices.size() * layersFromSource * convDimDomainTPTotal
+                        * (rnnModel.mDConv - 1) * tensorrt_llm::common::getDTypeSize(rnnState.mConvStateDataType);
+                    convInputBuffers[t] = bufferManager.gpu(
+                        runtime::ITensor::makeShape({static_cast<int64_t>(convBufBytes)}), nvinfer1::DataType::kUINT8);
+
+                    size_t connIdx = t % pickUpConnections.size();
+                    session.recv(pickUpConnections[connIdx], ssmInputBuffers[t]->data(), ssmBufBytes);
+                    totalBytesRecv += ssmBufBytes;
+                    session.recv(pickUpConnections[connIdx], convInputBuffers[t]->data(), convBufBytes);
+                    totalBytesRecv += convBufBytes;
+                }
+
+                // Concat received buffers into the pool
+                executor::rnn_cache::concatUnifiedPoolSsmDispatch(pool, realBlockIndices, ssmInputBuffers, destConfig,
+                    selfConfig, selfIdx, ssmBytes, blockSizeBytes, rnnState.mSsmStateDataType, bufferManager);
+                executor::rnn_cache::concatUnifiedPoolConvDispatch(pool, realBlockIndices, convInputBuffers, destConfig,
+                    selfConfig, selfIdx, ssmBytes, blockSizeBytes, rnnState.mConvStateDataType, bufferManager);
+
+                bufferManager.getStream().synchronize();
+
+                TLLM_LOG_INFO(
+                    "recvRecurrentStates (TP-mismatch concat): windowSize=0x%x, realBlocks=%zu, numSources=%zu, "
+                    "totalBytesRecv=%zu, requestId=%lu",
+                    ws, realBlockIndices.size(), numSources, totalBytesRecv, llmRequest.mRequestId);
             }
-            TLLM_LOG_INFO(
-                "recvRecurrentStates: windowSize=0x%x, totalBlockIds=%zu, realBlocks=%d, numLayers=%d, "
-                "totalBytesRecv=%zu, poolShape=%s, requestId=%lu",
-                ws, it->second.size(), realBlockCount, numLayers, totalBytesRecv,
-                runtime::ITensor::toString(pool->getShape()).c_str(), llmRequest.mRequestId);
         }
     };
 
