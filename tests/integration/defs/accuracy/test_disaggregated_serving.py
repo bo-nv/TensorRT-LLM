@@ -2017,9 +2017,9 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
             "max_batch_size": 32,
             "disable_overlap_scheduler": False,
             "cache_transceiver_config": cache_transceiver_config,
-            "tensor_parallel_size": 2,
-            "moe_expert_parallel_size": 2,
-            "pipeline_parallel_size": 2,
+            "tensor_parallel_size": 4,
+            "moe_expert_parallel_size": 4,
+            "pipeline_parallel_size": 1,
             "cuda_graph_config": {
                 "max_batch_size": 32,
                 "enable_padding": True,

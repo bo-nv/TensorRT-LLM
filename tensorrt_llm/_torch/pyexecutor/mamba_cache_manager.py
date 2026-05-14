@@ -1473,10 +1473,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             # not the internal self.requests order.  This is critical when
             # the batch is reordered after prepare_resources (e.g. disagg
             # serving sorts generation_requests by py_batch_idx).
-            return [
-                self._request_id_to_state_index.get(rid, 0)
-                for rid in request_ids
-            ]
+            return [self._request_id_to_state_index[rid] for rid in request_ids]
         return self.cuda_state_indices
 
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
