@@ -187,7 +187,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens, true));
     }
 
-    // RNN specific setup
+    // RNN specific setup (separate RnnStateManager path — e.g. MambaCacheManager)
     if (mRnnStateManager != nullptr)
     {
         TLLM_LOG_DEBUG("Setting up RNN cache transfer components.");
@@ -238,6 +238,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         }
 
         mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, rnnPoolDtype, rnnPoolDtype);
+
+        // Unified pool RNN transfer reuses the KV transfer buffer (inflated to max(kv, rnn) size).
+        // No separate RNN buffer registration is needed — avoids activateBuffer switching.
 
         TLLM_LOG_INFO(
             "Unified pool RNN config: numHeads=%d, headDim=%d, dState=%d, dConv=%d, "
@@ -311,14 +314,24 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         {
             kvBufferPtrs.push_back(mgr.get());
         }
-        return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA);
+        // For unified pool path (CppMambaHybridCacheManager), reuse the KV transfer buffer
+        // for RNN state transfer. The buffer is pre-inflated to max(kv, rnn) size.
+        // For the separate RnnStateManager path, RNN transfer is handled by RnnCacheFormatter.
+        BaseTransBufferManager* rnnBuf
+            = (mRnnStateManager == nullptr && !mCacheTransBufferManagers.empty() && mCacheState->hasRnnConfig())
+            ? mCacheTransBufferManagers[0].get()
+            : nullptr;
+        return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA, rnnBuf);
     };
 
     auto makeRnnFormatter = [this]() -> std::unique_ptr<RnnCacheFormatter>
     {
         if (mRnnStateManager != nullptr && mRnnCacheTransBufferManager != nullptr)
         {
-            return std::make_unique<RnnCacheFormatter>(mRnnStateManager, mRnnCacheTransBufferManager.get());
+            auto* rnnBuf
+                = dynamic_cast<rnn_state_manager::RnnCacheTransBufferManager*>(mRnnCacheTransBufferManager.get());
+            TLLM_CHECK_WITH_INFO(rnnBuf != nullptr, "RNN buffer manager type mismatch for RnnCacheFormatter");
+            return std::make_unique<RnnCacheFormatter>(mRnnStateManager, rnnBuf);
         }
         return nullptr;
     };

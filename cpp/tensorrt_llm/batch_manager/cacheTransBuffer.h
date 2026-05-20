@@ -81,8 +81,13 @@ public:
 
 private:
     /// @brief Compute transfer buffer size from KV cache configuration.
+    /// Also considers RNN state size for unified pool (CppMambaHybridCacheManager) and returns max.
     static size_t computeTransferBufferSize(KVCacheManager::BaseKVCacheManager* cacheManager,
         std::optional<size_t> maxNumTokens, bool transferIndexerKCache);
+
+    /// @brief Compute transfer buffer size for RNN state in unified pool path.
+    static size_t computeRnnPoolBufferSize(KVCacheManager::LinearAttentionMetadata const& linearMeta,
+        KVCacheManager::BlockManager const& blockManager, SizeType32 numLocalMambaLayers);
 
     KVCacheManager::BaseKVCacheManager* mCacheManager;
     bool mTransferIndexerKCache;

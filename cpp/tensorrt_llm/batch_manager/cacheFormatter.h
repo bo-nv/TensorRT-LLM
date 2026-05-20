@@ -237,9 +237,11 @@ public:
 class CacheFormatter final : public BaseCacheFormatter
 {
 public:
-    CacheFormatter(BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager)
+    CacheFormatter(BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager,
+        BaseTransBufferManager* rnnTransBufferManager = nullptr)
         : mCacheManager{cacheManager}
         , mCacheTransBufferManager{cacheTransBufferManager}
+        , mRnnTransBufferManager{rnnTransBufferManager}
     {
         TLLM_CHECK(mCacheManager);
         TLLM_CHECK(mCacheTransBufferManager);
@@ -269,9 +271,11 @@ public:
 private:
     BaseKVCacheManager* mCacheManager;
     CacheTransBufferManager* mCacheTransBufferManager;
+    BaseTransBufferManager* mRnnTransBufferManager; // For unified pool recurrent states (NIXL registration)
 };
 
 std::unique_ptr<BaseCacheFormatter> createCacheFormatter(BaseKVCacheManager* cacheManager,
-    std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA = false);
+    std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA = false,
+    BaseTransBufferManager* rnnTransBufferManager = nullptr);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

@@ -331,7 +331,7 @@ def launch_disaggregated_llm(
         gen_servers.append((env, gen_server_args))
 
     @contextlib.contextmanager
-    def multi_popen(server_configs, server_name="", enable_redirect_log=False):
+    def multi_popen(server_configs, server_name="", enable_redirect_log=True):
         processes = []
         log_files = []
         try:
@@ -1978,7 +1978,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
-@skip_pre_blackwell
+# @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
@@ -1993,7 +1993,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
             }
         else:
             cache_transceiver_config = {
-                "backend": backend,
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 8192,
             }
 

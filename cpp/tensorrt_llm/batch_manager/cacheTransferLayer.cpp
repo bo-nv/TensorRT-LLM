@@ -81,8 +81,10 @@ std::vector<SizeType32> CacheTransferLayer::computeCounterparts(
     auto counterparts
         = executor::kv_cache::targetIRanks(peerState.getCacheState().value(), mCacheState, selfIdx).mIRanks;
 
-    // Add RNN counterparts that are not already in the KV set
-    if (mRnnFormatter && mCacheState.hasRnnConfig() && peerState.getCacheState().value().hasRnnConfig())
+    // Add RNN counterparts that are not already in the KV set.
+    // This applies both when a separate RnnFormatter exists (RnnStateManager path)
+    // and when the unified pool path handles RNN internally (CppMambaHybridCacheManager).
+    if (mCacheState.hasRnnConfig() && peerState.getCacheState().value().hasRnnConfig())
     {
         auto rnnCounterparts
             = executor::kv_cache::targetIRanksForRnn(peerState.getCacheState().value(), mCacheState, selfIdx).mIRanks;

@@ -22,6 +22,7 @@
 #include "tensorrt_llm/executor/executor.h"
 
 #include <NvInferRuntimeBase.h>
+#include <algorithm>
 #include <mutex>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
@@ -191,6 +192,26 @@ bool FabricMemory::supportFbaricMemory()
 // CacheTransBufferManager Implementation
 // ============================================================================
 
+size_t CacheTransBufferManager::computeRnnPoolBufferSize(KVCacheManager::LinearAttentionMetadata const& linearMeta,
+    KVCacheManager::BlockManager const& blockManager, SizeType32 numLocalMambaLayers)
+{
+    SizeType32 const tokensPerBlock = blockManager.getTokensPerBlock();
+    SizeType32 const maxBlocksPerSeq = blockManager.getWindowSizeMetadata(linearMeta.cacheType).maxBlocksPerSeq;
+
+    SizeType32 maxRealBlocks = 1; // At minimum, the final state block
+    if (linearMeta.statesSnapshotInterval > 0)
+    {
+        SizeType32 const snapshotBlockInterval = std::max(
+            static_cast<SizeType32>(1), static_cast<SizeType32>(linearMeta.statesSnapshotInterval / tokensPerBlock));
+        maxRealBlocks = maxBlocksPerSeq / snapshotBlockInterval + 1;
+        if (linearMeta.saveLastSnapshot)
+        {
+            maxRealBlocks += 1;
+        }
+    }
+    return static_cast<size_t>(maxRealBlocks) * numLocalMambaLayers * linearMeta.allRecurrentStatesBytes;
+}
+
 size_t CacheTransBufferManager::computeTransferBufferSize(
     KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
 {
@@ -239,7 +260,35 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
         }
     }
 
-    return maxNumTokens.has_value() ? bufferSizeFromMaxNumToken : common::getEnvMemSizeForKVCacheTransferBuffer();
+    size_t kvSize
+        = maxNumTokens.has_value() ? bufferSizeFromMaxNumToken : common::getEnvMemSizeForKVCacheTransferBuffer();
+
+    // For unified pool hybrid models (CppMambaHybridCacheManager), also consider
+    // the RNN state transfer size so the buffer can serve both KV and RNN sequentially.
+    // Only inflate the primary KV buffer, not the MLA indexer buffer.
+    auto const& blockManager = cacheManager->getBlockManager();
+    auto const& linearMeta = blockManager.getLinearAttentionMetadata();
+    if (linearMeta.has_value() && !transferIndexerKCache)
+    {
+        // Count local mamba layers from block manager (layers using recurrent state pool).
+        SizeType32 numLocalMambaLayers = 0;
+        for (SizeType32 layerId = 0; layerId < blockManager.getNumLayers(); ++layerId)
+        {
+            auto poolIdx = blockManager.getLayerPoolIdx(layerId);
+            auto ws = blockManager.getPoolWindowSize(poolIdx);
+            if (LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+            {
+                numLocalMambaLayers++;
+            }
+        }
+        if (numLocalMambaLayers > 0)
+        {
+            size_t rnnSize = computeRnnPoolBufferSize(*linearMeta, blockManager, numLocalMambaLayers);
+            kvSize = std::max(kvSize, rnnSize);
+        }
+    }
+
+    return kvSize;
 }
 
 CacheTransBufferManager::CacheTransBufferManager(
