@@ -1,0 +1,114 @@
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: gb200
+  account: coreai_comparch_trtllm
+  job_time: 04:00:00
+  job_name: r1_50000_2048_c[76, 84, 91]
+  set_segment: true
+  numa_bind: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: false
+  multi_round: 16
+  benchmark_ratio: 1
+  streaming: true
+  concurrency_list: '91'
+  input_length: 50000
+  output_length: 2048
+  dataset_file:
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 3
+  num_gen_servers: 1
+environment:
+  container_mount: /lustre:/lustre
+  container_image: /lustre/fsw/coreai_comparch_trtllm/deemod/sqsh/urm.nvidia.com_sw-tensorrt-docker_tensorrt-llm_pytorch-26.05-py3-sbsa-ubuntu24.04-skip-tritondevel-202607211045-16608.sqsh
+  model_path: /lustre/fsw/coreai_comparch_trtllm/common/llm-models/Nemotron-Ultra-V3-rl3-050826-mixed_nvfp4-fp8_amax_1024x65k
+  trtllm_repo: <trtllm_repo>
+  build_wheel: false
+  cuda_architectures: ''
+  trtllm_wheel_path: ''
+  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1
+    TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes NCCL_GRAPH_MIXING_SUPPORT=0 MIMALLOC_PURGE_DELAY=0
+  server_env_var: TRTLLM_SERVER_DISABLE_GC=1
+  work_dir: /lustre/fsw/coreai_comparch_trtllm/deemod/TensorRT-LLM/examples/disaggregated/slurm/benchmark/
+  ctx_worker_env_var: ''
+  gen_worker_env_var: ' TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.98 TRTLLM_USE_MAMBA_REPLAY=1'
+profiling:
+  nsys_on: false
+  ctx_profile_range: 10-30
+  gen_profile_range: 200-250
+accuracy:
+  enable_accuracy_test: false
+  tasks:
+    gsm8k:
+      model: local-completions
+      model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=7200,max_gen_toks=16384
+      extra_kwargs:
+        trust_remote_code: true
+worker_config:
+  gen:
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    enable_attention_dp: true
+    enable_lm_head_tp_in_adp: true
+    pipeline_parallel_size: 1
+    max_batch_size: 16
+    max_num_tokens: 96
+    max_seq_len: 52304
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.85
+      dtype: fp8
+      mamba_ssm_cache_dtype: float16
+      mamba_ssm_stochastic_rounding: true
+      mamba_ssm_philox_rounds: 5
+    moe_config:
+      backend: CUTEDSL
+      use_low_precision_moe_combine: true
+    cache_transceiver_config:
+      max_tokens_in_buffer: 50256
+      backend: NIXL
+      transceiver_runtime: PYTHON
+    stream_interval: 20
+    num_postprocess_workers: 4
+    speculative_config:
+      decoding_type: MTP
+      num_nextn_predict_layers: 5
+  ctx:
+    max_batch_size: 8
+    max_num_tokens: 50256
+    max_seq_len: 50256
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    print_iter_log: true
+    cuda_graph_config: null
+    disable_overlap_scheduler: true
+    moe_config:
+      backend: CUTEDSL
+      max_num_tokens: 65536
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.5
+      dtype: fp8
+      mamba_ssm_cache_dtype: float16
+      mamba_ssm_stochastic_rounding: true
+      mamba_ssm_philox_rounds: 5
+    cache_transceiver_config:
+      max_tokens_in_buffer: 50256
+      backend: NIXL
+      transceiver_runtime: PYTHON
+    speculative_config:
+      decoding_type: MTP
+      num_nextn_predict_layers: 5
