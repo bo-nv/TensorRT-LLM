@@ -22,7 +22,7 @@ hardware:
   num_gen_servers: 2
 environment:
   container_mount: /lustre:/lustre
-  container_image: /lustre/fsw/coreai_comparch_trtllm/deemod/sqsh/urm.nvidia.com_sw-tensorrt-docker_tensorrt-llm_pytorch-26.05-py3-sbsa-ubuntu24.04-skip-tritondevel-202607211045-16608.sqsh
+  container_image: /lustre/fsw/coreai_comparch_trtllm/deemod/sqsh/urm.nvidia.com_sw-tensorrt-docker_tensorrt-llm_pytorch-26.05-py3-sbsa-ubuntu24.04-skip-tritondevel-202607271403-16694.sqsh
   model_path: /lustre/fsw/coreai_comparch_trtllm/common/llm-models/Nemotron-Ultra-V3-rl3-050826-mixed_nvfp4-fp8_amax_1024x65k
   trtllm_repo: <trtllm_repo>
   build_wheel: false
