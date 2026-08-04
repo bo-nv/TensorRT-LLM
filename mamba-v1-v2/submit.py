@@ -141,7 +141,6 @@ def update_config(
             "kv_cache_config",
             f"config.worker_config.{role}",
         )
-
         if mode == "v1":
             transceiver_config = require_mapping(
                 role_config,
