@@ -227,6 +227,8 @@ class VmmBounceTransport(BounceTransport):
             return self._skip_bounce(f"{nblocks} blocks < min {self._min_blocks} (too small)")
         total = 0
         for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups):
+            if int(block_ids.size) == 0:
+                continue
             if g >= len(self._block_bytes_per_group):
                 return self._skip_bounce(f"layer group {g} has no known slot size (e.g. mamba)")
             total += int(block_ids.size) * self._block_bytes_per_group[g]
