@@ -592,6 +592,11 @@ def submit_job(config, log_dir, dry_run):
         server_config.update(config['server_config_extra'])
     # Always enable perf metrics collection for TTFT breakdown analysis
     server_config.setdefault('perf_metrics_output_dir', log_dir)
+    # Enable worker-side per-request perf metrics so disagg server receives
+    # timing details (kv_cache_transfer_start/end) from workers.
+    upsert_env_config(env_config, 'worker_env_var',
+                      'TRTLLM_KVCACHE_TIME_OUTPUT_PATH',
+                      f'TRTLLM_KVCACHE_TIME_OUTPUT_PATH={log_dir}')
     with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
         yaml.dump(server_config, f)
     disagg_server_hostname = server_config['hostname']
