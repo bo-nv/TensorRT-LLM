@@ -156,6 +156,7 @@ for concurrency in ${concurrency_list}; do
         --result-dir "${log_path}/concurrency_${concurrency}" \
         --result-filename "result.json" \
         --percentile-metrics "ttft,tpot,itl,e2el" \
+        --save-request-time-breakdown "${log_path}" \
         $(if [ "${streaming}" = "false" ]; then echo "--non-streaming"; fi)
     echo "Benchmark with concurrency ${concurrency} done"
     do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "log"
