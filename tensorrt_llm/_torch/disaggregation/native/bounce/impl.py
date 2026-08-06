@@ -534,15 +534,20 @@ def decode_result_tail(message):
 
 
 def block_bytes_per_group(page_table) -> list:
-    """Byte size of one cache block for each leading attention layer group, stopping at the first
-    non-attention group."""
+    """Byte size of one cache block for each layer group. Non-attention groups (e.g. mamba) get 0
+    since their block_ids are always empty and skipped in reserve(); what matters is that the
+    indexing stays aligned so attention groups at any position are looked up correctly."""
     from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
     from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 
     assert page_table is not None
     out: list = []
     for lg_idx, lg in enumerate(page_table.layer_groups):
-        if not isinstance(lg, AttentionLayerGroup):
-            break
-        out.append(int(get_physical_pool(page_table, lg_idx, 0).slot_bytes))
+        if isinstance(lg, AttentionLayerGroup):
+            out.append(int(get_physical_pool(page_table, lg_idx, 0).slot_bytes))
+        else:
+            # Mamba/other groups always have empty block_ids, so their slot
+            # bytes are never multiplied in reserve(); use 0 as placeholder to
+            # keep the list indexed in sync with block_ids_per_layer_groups.
+            out.append(0)
     return out
