@@ -232,6 +232,12 @@ class VmmBounceTransport(BounceTransport):
             if g >= len(self._block_bytes_per_group):
                 return self._skip_bounce(f"layer group {g} has no known slot size (e.g. mamba)")
             total += int(block_ids.size) * self._block_bytes_per_group[g]
+        # Include mamba SSM state bytes in the region size so the sender's
+        # coalesced write (KV + mamba fragments) fits within the bounce region.
+        # mamba_transfer_bytes is the per-writer contribution; in fan-in each
+        # writer sends its own mamba slice, so scale by num_writers.
+        mamba_bytes = getattr(recv_req, "mamba_transfer_bytes", 0)
+        total += mamba_bytes * num_writers
         if total <= 0:
             return self._skip_bounce(f"computed transfer size {total} <= 0")
         if num_writers > 1 and total % num_writers != 0:

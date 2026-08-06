@@ -381,6 +381,31 @@ class TestFanInReserve:
         t = _make_transport(monkeypatch, block_bytes_per_group=[1000], capacity=500)
         assert t.reserve(_recv_req([2]), num_writers=1) is False  # total 2000 > cap 500
 
+    def test_reserve_includes_mamba_transfer_bytes(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100], capacity=1 << 30)
+        req = SimpleNamespace(
+            block_ids_per_layer_groups=[SimpleNamespace(size=100)],
+            unique_rid=1,
+            slice_id=0,
+            bounce_dst_base=None,
+            mamba_transfer_bytes=500,
+        )
+        # total should be 100*100 + 500 = 10500, which fits in capacity
+        assert t.reserve(req, num_writers=1) is True
+
+    def test_reserve_mamba_bytes_cause_oversize_falls_back(self, monkeypatch):
+        # Region capacity is smaller than KV + mamba combined
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100], capacity=5000)
+        req = SimpleNamespace(
+            block_ids_per_layer_groups=[SimpleNamespace(size=100)],
+            unique_rid=1,
+            slice_id=0,
+            bounce_dst_base=None,
+            mamba_transfer_bytes=50000,
+        )
+        # total = 100*100 + 50000 = 60000 > capacity 5000
+        assert t.reserve(req, num_writers=1) is False
+
     def test_fanin_scatters_ordered_by_src_base(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         req = _recv_req([2])

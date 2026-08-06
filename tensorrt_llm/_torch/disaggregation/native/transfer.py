@@ -94,6 +94,7 @@ class RecvReqInfo:
     dst_start_token: Optional[int] = None
     aux_slot: Optional[int] = None
     mamba_state_index: Optional[int] = None
+    mamba_transfer_bytes: int = 0
     slice_id: Optional[int] = None
     bounce_dst_base: Optional[int] = None
 
@@ -1584,6 +1585,16 @@ class Receiver(ReceiverBase):
         receiver_req = self._build_recv_req_info(task)
         sender_dp_rank = params.ctx_dp_rank
         peer_infos: RankInfo = self._get_sender_info(params)
+
+        # Pre-compute mamba state transfer bytes so the bounce buffer can size
+        # the receive region to hold both KV and SSM fragments.
+        if receiver_req.mamba_state_index is not None and peer_infos.page_table is not None:
+            receiver_req.mamba_transfer_bytes = MambaPolicy.compute_transfer_bytes(
+                self_page_table=peer_infos.page_table,
+                peer_page_table=self._registrar.self_rank_info.page_table,
+                self_ri=peer_infos,
+                peer_ri=self._registrar.self_rank_info,
+            )
 
         if sender_dp_rank is not None:
             # Normal path: ctx_dp_rank is known, send to overlapping ranks.

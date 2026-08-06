@@ -493,6 +493,63 @@ class MambaPolicy:
         return src_frags, dst_frags, kv_sizes
 
     @staticmethod
+    def compute_transfer_bytes(
+        self_page_table: KVCachePageTable,
+        peer_page_table: KVCachePageTable,
+        self_ri: RankInfo,
+        peer_ri: RankInfo,
+    ) -> int:
+        """Compute the total mamba state transfer bytes without building fragment lists.
+
+        Used by the bounce buffer to correctly size the receive region.
+        Returns 0 if no mamba transfer is needed.
+        """
+        self_mlg = next(
+            (lg for lg in self_page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
+            None,
+        )
+        peer_mlg = next(
+            (lg for lg in peer_page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
+            None,
+        )
+        if self_mlg is None or peer_mlg is None:
+            return 0
+
+        overlapping_layers = sorted(
+            set(self_mlg.mamba_layer_offsets.keys()) & set(peer_mlg.mamba_layer_offsets.keys())
+        )
+        transfer_layers = len(overlapping_layers)
+        if transfer_layers == 0:
+            return 0
+
+        self_mamba_tp, _ = MambaPolicy._mamba_tp(self_ri)
+        peer_mamba_tp, _ = MambaPolicy._mamba_tp(peer_ri)
+        tp_match = self_mamba_tp == peer_mamba_tp
+
+        total = 0
+        for self_pool, peer_pool, is_conv in [
+            (self_mlg.conv_states, peer_mlg.conv_states, True),
+            (self_mlg.ssm_states, peer_mlg.ssm_states, False),
+        ]:
+            if tp_match:
+                # MambaHeadMatchMapper: transfer_layers fragments of slot_bytes each
+                total += transfer_layers * self_pool.slot_bytes
+            elif is_conv:
+                # ConvStateMismatchMapper: per-section min bytes
+                self_sections = self_mlg.conv_section_bytes or [self_pool.slot_bytes]
+                peer_sections = peer_mlg.conv_section_bytes or [peer_pool.slot_bytes]
+                section_bytes = sum(min(s, p) for s, p in zip(self_sections, peer_sections))
+                total += transfer_layers * section_bytes
+            else:
+                # MambaHeadMismatchMapper: min heads * bytes_per_head
+                self_nheads = self_pool.slot_bytes // self_mlg.ssm_bytes_per_head
+                peer_nheads = peer_pool.slot_bytes // peer_mlg.ssm_bytes_per_head
+                cont_heads = min(self_nheads, peer_nheads)
+                total += transfer_layers * cont_heads * self_mlg.ssm_bytes_per_head
+
+        return total
+
+    @staticmethod
     def collect_frags(
         self_page_table: KVCachePageTable,
         peer_page_table: KVCachePageTable,
