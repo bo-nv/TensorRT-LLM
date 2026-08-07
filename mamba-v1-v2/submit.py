@@ -153,6 +153,12 @@ def update_config(
             kv_cache_config["use_kv_cache_manager_v2"] = False
         else:
             kv_cache_config["use_kv_cache_manager_v2"] = True
+            transceiver_config = require_mapping(
+                role_config,
+                "cache_transceiver_config",
+                f"config.worker_config.{role}",
+            )
+            transceiver_config["kv_cache_bounce_size_mb"] = 512
 
 
 def save_config(config: Config, output_path: Path) -> None:
