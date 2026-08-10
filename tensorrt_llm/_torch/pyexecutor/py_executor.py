@@ -5849,7 +5849,17 @@ class PyExecutor:
         if not self.enable_attention_dp:
             return
 
-        assert self.expected_num_active_requests >= len(self.active_requests)
+        # Routing invariant: real (non-dummy) requests must not exceed the
+        # planned expected count.  In the overlap scheduler, _update_requests
+        # processes the *previous* batch, so a dummy added last iteration
+        # survives into this one (it will be cleaned up after this iteration's
+        # forward).  Exclude dummies from the routing check but cap at 1.
+        num_real_active = sum(1 for r in self.active_requests
+                              if not r.is_attention_dp_dummy)
+        num_dummy_requests = len(self.active_requests) - num_real_active
+        assert self.expected_num_active_requests >= num_real_active
+        assert num_dummy_requests <= 1
+        assert num_real_active <= self.max_num_active_requests
         num_active_request = self._count_schedulable_active_requests()
 
         if self._should_skip_dummy_for_benchmark_disagg(num_active_request):

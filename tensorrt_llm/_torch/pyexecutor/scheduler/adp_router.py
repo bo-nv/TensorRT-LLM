@@ -307,18 +307,11 @@ class ADPRouter(ABC):
         fair_share = (
             sum(all_ranks_num_active_requests) + num_new_requests + tp_size - 1
         ) // tp_size
-        current_max = max(all_ranks_num_active_requests)
         expected = max(
             math.ceil(multiplier * fair_share),
-            current_max,
+            max(all_ranks_num_active_requests),
         )
-        if hard_cap is not None:
-            # Cap new assignments but never below the actual busiest rank's
-            # load — in disagg serving a rank may temporarily exceed hard_cap
-            # due to ADP dummy requests added when all real requests are
-            # in-transfer (not yet schedulable).
-            expected = max(min(expected, hard_cap), current_max)
-        return expected
+        return min(expected, hard_cap) if hard_cap is not None else expected
 
     @abstractmethod
     def route_requests(
