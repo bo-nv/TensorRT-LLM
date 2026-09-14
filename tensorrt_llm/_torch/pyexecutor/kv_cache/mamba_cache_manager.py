@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
     from tensorrt_llm.sampling_params import SamplingParams
 
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role)
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
@@ -3735,6 +3736,23 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
         return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
+
+    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
+        """Attention roles from the base manager plus the recurrent-state roles.
+
+        SSM state ``(nheads, head_dim, d_state)`` is head-major, so it is
+        re-split like HND K/V (one head per unit). Convolution state
+        ``(conv_dim, d_conv - 1)`` is a flat ``[x|B|C]`` / ``[q|k|v]`` row that
+        must be split per section. Which rank axis shards them, and the unit
+        and section sizes, are derived by the disaggregation page-table
+        builder from ``mapping``/``ssm_state_shape``/``conv_section_dims``.
+        Qwen4-Exp PLE roles are intentionally not declared yet; the builder
+        rejects undeclared recurrent roles instead of dropping them.
+        """
+        kinds = dict(super().get_disagg_role_mapper_kinds())
+        kinds[MambaRole.SSM_STATE] = MapperKind.HND
+        kinds[MambaRole.CONV_STATE] = MapperKind.SECTIONED
+        return kinds
 
     def _get_pool_roles(self,
                         pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:

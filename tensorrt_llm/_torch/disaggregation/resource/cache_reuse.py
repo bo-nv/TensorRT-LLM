@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,13 +22,14 @@ import numpy as np
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
-from .page import AttentionLayerGroup
+from .page import LayerGroup
 from .utils import get_global_layer_ids
 
 
 class CacheReuseAdapter(ABC):
-    """Uniform prefix-reuse API over KVCacheManager V1/V2."""
+    """Uniform per-request slot and prefix-reuse API over KVCacheManager V1/V2."""
 
     @property
     @abstractmethod
@@ -38,6 +39,11 @@ class CacheReuseAdapter(ABC):
     @abstractmethod
     def tokens_per_block(self) -> int: ...
 
+    @property
+    @abstractmethod
+    def num_extra_kv_tokens(self) -> int:
+        """Extra KV slots the manager allocates past the prompt (speculative decoding)."""
+
     @abstractmethod
     def _global_cached_token_count(self, req: LlmRequest) -> int:
         """Block-aligned cached prefix length reported by the cache manager."""
@@ -45,7 +51,7 @@ class CacheReuseAdapter(ABC):
     def get_cached_token_count_per_layer_group(
         self,
         req: LlmRequest,
-        layer_groups: Sequence[AttentionLayerGroup],
+        layer_groups: Sequence[LayerGroup],
     ) -> List[int]:
         """Per-layer-group cached prefix in tokens (block-aligned).
 
@@ -58,20 +64,24 @@ class CacheReuseAdapter(ABC):
         return [scalar] * len(layer_groups)
 
     @abstractmethod
-    def get_block_ids(
+    def get_slot_ids(
         self,
         req: LlmRequest,
         group_idx: int,
-        lg: AttentionLayerGroup,
+        lg: LayerGroup,
     ) -> np.ndarray:
-        """Per-layer-group block identifiers for *req* (dtype ``int64``).
+        """All slot ids *req* owns in layer group *group_idx* (dtype ``int64``).
 
-        Returned values are **primary memory-pool slot indices**, not raw block IDs:
-        ``KVRegionExtractorV1.extract`` and downstream transfer code do
-        ``base_ptr + slot_idx * slot_bytes`` and require the value to be a current
-        primary-pool offset. With host offload enabled, a block's logical ID can
-        diverge from its primary slot index after offload/onboard, so each backend
-        must translate before returning.
+        For a group with a token axis this is the request's block list in
+        token order; for a per-request state group it is the single state slot
+        (or empty when the rank holds no state for the request).
+
+        Returned values are **primary memory-pool slot indices**, not raw block
+        IDs: ``KVRegionExtractorV1.extract`` and downstream transfer code do
+        ``base_ptr + slot_idx * slot_stride`` and require the value to be a
+        current primary-pool offset. With host offload enabled, a block's
+        logical ID can diverge from its primary slot index after
+        offload/onboard, so each backend must translate before returning.
         """
 
     @abstractmethod
@@ -96,13 +106,24 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
     def tokens_per_block(self) -> int:
         return self._mgr.tokens_per_block
 
+    @property
+    def num_extra_kv_tokens(self) -> int:
+        return int(getattr(self._mgr, "num_extra_kv_tokens", 0))
+
     def _global_cached_token_count(self, req: LlmRequest) -> int:
         if not self.enable_block_reuse:
             return 0
         tpb = self.tokens_per_block
         return (req.prepopulated_prompt_len // tpb) * tpb
 
-    def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
+    def get_slot_ids(self, req, group_idx, lg):  # noqa: ARG002
+        if not lg.has_token_axis:
+            # V1 hybrid manager keeps the recurrent state outside the C++ KV
+            # cache; its per-request slot is the mamba cache index.
+            index_map = getattr(self._mgr, "mamba_cache_index", None)
+            if index_map is None or req.py_request_id not in index_map:
+                return np.array([], dtype=np.int64)
+            return np.array([int(index_map[req.py_request_id])], dtype=np.int64)
         first_layer = get_global_layer_ids(lg)[0]
         beam_width = req.py_beam_width
         raw_ids = self._mgr.get_batch_cache_indices(
@@ -114,9 +135,9 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
         # so the cache transceiver's pointer arithmetic is correct. The manager aborts
         # if any referenced block is currently offloaded — disagg transfer cannot read
         # from the secondary pool, and a held block can never be offloaded.
-        window_size = lg.sliding_window_size
+        window_size = lg.live_token_window
         # V1 layer groups carry the manager's window key (full-attention layers get the
-        # max window), so this is always set; see kv_extractor.build_page_table.
+        # max window), so this is always set; see page_table_v1.build_page_table.
         assert window_size is not None
         pool_indices = self._mgr.get_memory_pool_block_indices(
             list(raw_ids), window_size=window_size
@@ -143,6 +164,10 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
     def tokens_per_block(self) -> int:
         return self._mgr.tokens_per_block
 
+    @property
+    def num_extra_kv_tokens(self) -> int:
+        return int(getattr(self._mgr, "num_extra_kv_tokens", 0))
+
     def _global_cached_token_count(self, req: LlmRequest) -> int:
         if not self.enable_block_reuse:
             return 0
@@ -152,16 +177,24 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         tpb = self.tokens_per_block
         return (kv_cache.num_committed_tokens // tpb) * tpb
 
-    def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
+    def get_slot_ids(self, req, group_idx, lg):
         # V2 already returns per-cache-level pool slot indices (not logical block
         # IDs), and active sequences GPU-lock their pages (_UniqPageLock enforces
         # cache_level==GPU), so the slot_ids yielded here are already the right
         # offsets for primary-pool pointer arithmetic. No translation is needed,
-        # unlike V1 (see _CacheReuseAdapterV1.get_block_ids).
+        # unlike V1 (see _CacheReuseAdapterV1.get_slot_ids).
+        kv_cache = self._mgr.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return np.array([], dtype=np.int64)
+        if not lg.has_token_axis:
+            # Per-request state lives in the life cycle's single SSM slot,
+            # which the V2 core tracks separately from the paged blocks.
+            slot = int(kv_cache.get_ssm_block_base_index(group_idx))
+            if slot == BAD_PAGE_INDEX or slot < 0:
+                return np.array([], dtype=np.int64)
+            return np.array([slot], dtype=np.int64)
         return np.fromiter(
-            self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
-                group_idx, valid_only=True
-            ),
+            kv_cache.get_aggregated_page_indices(group_idx, valid_only=True),
             dtype=np.int64,
         )
 

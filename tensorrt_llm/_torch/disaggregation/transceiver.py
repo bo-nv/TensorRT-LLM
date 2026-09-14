@@ -49,8 +49,11 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
+from tensorrt_llm._torch.disaggregation.resource.page import LayerGroup
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_physical_pool,
+    get_pool_view_num_layers,
+)
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
@@ -354,30 +357,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.shutdown()
 
-    def _get_mamba_slot_for_request(self, req: LlmRequest) -> Optional[int]:
-        """Get the mamba state slot index for a request, or None."""
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
-            if self._kv_cache_manager.local_num_mamba_layers > 0:
-                return self._kv_cache_manager._request_id_to_state_index[req.py_request_id]
-        elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):
-            return self._kv_cache_manager.mamba_cache_index[req.py_request_id]
-        return None
-
     def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
-        """Create a KV slice covering the request's whole prompt."""
+        """Create a KV slice covering the request's whole prompt.
+
+        Every layer group contributes the request's slot list. Groups with a
+        token axis (paged KV) are trimmed to the transferable prompt range by
+        :meth:`_select_paged_slots`; per-request state groups (no token axis)
+        pass their single slot through untouched.
+        """
         adapter = self._reuse_adapter
-        tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
-        # The transfer covers prompt_len tokens; num_extra_kv_tokens slots
-        # (speculative decoding) are not transferred. In the previously added
-        # support for ctx disabling speculative decoding while gen enables it,
-        # both sides currently use prompt_len as the transfer range, so the
-        # ranges stay consistent.
-        # TODO: the accuracy impact of not transferring num_extra_kv_tokens
-        # on MTP and other speculative decoding paths is currently unclear;
-        # revisit whether these extra KV slots need to be transferred.
-        prompt_blocks = (req.prompt_len + tpb - 1) // tpb
 
         is_gen_only = req.is_generation_only_request
         cached_per_lg = (
@@ -388,78 +378,92 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         groups = []
         for idx, lg in enumerate(layer_groups):
-            if lg.kind == CacheKind.STATE:
-                slot = self._get_mamba_slot_for_request(req)
-                groups.append(
-                    np.array([slot], dtype=np.int64)
-                    if slot is not None
-                    else np.array([], dtype=np.int64)
-                )
+            slot_ids = adapter.get_slot_ids(req, idx, lg)
+            if not lg.has_token_axis:
+                groups.append(slot_ids)
                 continue
-            block_ids = adapter.get_block_ids(req, idx, lg)
-            window_size = lg.sliding_window_size
-
-            if window_size is not None:
-                draft_len = get_draft_token_length(req) if is_gen_only else 0
-                allocated_blocks = (
-                    req.prompt_len
-                    + draft_len
-                    + self._kv_cache_manager.num_extra_kv_tokens
-                    + tpb
-                    - 1
-                ) // tpb
-                beam0_block_ids, tail_block_ids = self._split_packed_beam_block_ids(
-                    block_ids,
-                    req.py_beam_width,
-                    allocated_blocks,
-                )
-                if beam0_block_ids.size > allocated_blocks:
-                    beam0_block_ids = beam0_block_ids[:allocated_blocks]
-                    block_ids = (
-                        np.concatenate([beam0_block_ids, tail_block_ids])
-                        if tail_block_ids.size > 0
-                        else beam0_block_ids
-                    )
-                # Current PyExecutor cache managers disable KV-cache token sinks,
-                # so SWA block lists contain an evictable prompt prefix followed
-                # by the speculative scratch tail. If token sinks are enabled,
-                # this must use block-ordinal metadata to preserve the sink prefix.
-                # Remove scratch before trimming stale prompt blocks; otherwise a
-                # boundary-crossing allocation can displace initialized prompt KV.
-                scratch_blocks = max(0, allocated_blocks - prompt_blocks)
-                if scratch_blocks > 0:
-                    if req.py_beam_width != 1:
-                        raise ValueError("speculative scratch blocks require beam_width == 1")
-                    block_ids = (
-                        block_ids[:-scratch_blocks]
-                        if scratch_blocks < block_ids.size
-                        else np.array([], dtype=np.int64)
-                    )
-                # Drop stale blocks the manager may still expose (V1 pre-eviction).
-                stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
-                expected_valid = max(0, prompt_blocks - stale_end)
-                # Skip reused blocks that remain after stale-prefix pruning.
-                cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
-            else:
-                # Drop the speculative scratch tail; only prompt_len is transferred.
-                if block_ids.size > prompt_blocks:
-                    block_ids = block_ids[:prompt_blocks]
-                expected_valid = prompt_blocks
-                cache_skip = cached_per_lg[idx] // tpb
-
-            block_ids = self._trim_packed_beam_block_ids(
-                block_ids,
-                beam_width=req.py_beam_width,
-                total_blocks=prompt_blocks,
-                expected_valid=expected_valid,
-                cache_skip=cache_skip,
-            )
-
-            groups.append(block_ids)
+            groups.append(self._select_paged_slots(req, lg, slot_ids, cached_per_lg[idx]))
 
         return KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=groups,
+        )
+
+    def _select_paged_slots(
+        self,
+        req: LlmRequest,
+        lg: LayerGroup,
+        block_ids: np.ndarray,
+        cached_tokens: int,
+    ) -> np.ndarray:
+        """Trim a paged group's block list to the blocks that must be transferred.
+
+        Drops the speculative scratch tail, stale sliding-window blocks and the
+        reused prefix, preserving packed beam-tail blocks. The transfer covers
+        prompt_len tokens; num_extra_kv_tokens slots (speculative decoding)
+        are not transferred. In the previously added support for ctx disabling
+        speculative decoding while gen enables it, both sides currently use
+        prompt_len as the transfer range, so the ranges stay consistent.
+        TODO: the accuracy impact of not transferring num_extra_kv_tokens on
+        MTP and other speculative decoding paths is currently unclear; revisit
+        whether these extra KV slots need to be transferred.
+        """
+        tpb = lg.tokens_per_slot
+        assert tpb is not None
+        prompt_blocks = (req.prompt_len + tpb - 1) // tpb
+        is_gen_only = req.is_generation_only_request
+        window_size = lg.live_token_window
+
+        if window_size is not None:
+            draft_len = get_draft_token_length(req) if is_gen_only else 0
+            allocated_blocks = (
+                req.prompt_len + draft_len + self._reuse_adapter.num_extra_kv_tokens + tpb - 1
+            ) // tpb
+            beam0_block_ids, tail_block_ids = self._split_packed_beam_block_ids(
+                block_ids,
+                req.py_beam_width,
+                allocated_blocks,
+            )
+            if beam0_block_ids.size > allocated_blocks:
+                beam0_block_ids = beam0_block_ids[:allocated_blocks]
+                block_ids = (
+                    np.concatenate([beam0_block_ids, tail_block_ids])
+                    if tail_block_ids.size > 0
+                    else beam0_block_ids
+                )
+            # Current PyExecutor cache managers disable KV-cache token sinks,
+            # so SWA block lists contain an evictable prompt prefix followed
+            # by the speculative scratch tail. If token sinks are enabled,
+            # this must use block-ordinal metadata to preserve the sink prefix.
+            # Remove scratch before trimming stale prompt blocks; otherwise a
+            # boundary-crossing allocation can displace initialized prompt KV.
+            scratch_blocks = max(0, allocated_blocks - prompt_blocks)
+            if scratch_blocks > 0:
+                if req.py_beam_width != 1:
+                    raise ValueError("speculative scratch blocks require beam_width == 1")
+                block_ids = (
+                    block_ids[:-scratch_blocks]
+                    if scratch_blocks < block_ids.size
+                    else np.array([], dtype=np.int64)
+                )
+            # Drop stale blocks the manager may still expose (V1 pre-eviction).
+            stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
+            expected_valid = max(0, prompt_blocks - stale_end)
+            # Skip reused blocks that remain after stale-prefix pruning.
+            cache_skip = max(0, cached_tokens // tpb - stale_end)
+        else:
+            # Drop the speculative scratch tail; only prompt_len is transferred.
+            if block_ids.size > prompt_blocks:
+                block_ids = block_ids[:prompt_blocks]
+            expected_valid = prompt_blocks
+            cache_skip = cached_tokens // tpb
+
+        return self._trim_packed_beam_block_ids(
+            block_ids,
+            beam_width=req.py_beam_width,
+            total_blocks=prompt_blocks,
+            expected_valid=expected_valid,
+            cache_skip=cache_skip,
         )
 
     def _slice_num_bytes(self, slice: KVSlice) -> int:
@@ -483,14 +487,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 continue
             lg = pt.layer_groups[lg_id]
             for pv in lg.pool_views:
-                pool = get_physical_pool(pt, lg_id, pv.pool_idx)
-                if lg.kind == CacheKind.STATE:
-                    # STATE: n=1 (one slot), but transfer covers all layers.
-                    num_layers = len(lg.local_layers)
-                    total += num_layers * pool.slot_bytes
+                if not lg.has_token_axis:
+                    # Per-request state: one slot; the view's per-layer region
+                    # is transferred for every layer it covers.
+                    total += int(pv.bytes_per_layer) * get_pool_view_num_layers(pv)
                 else:
-                    # Attention: n blocks, each slot covers all layers.
-                    total += n * pool.slot_bytes
+                    # Paged KV: n blocks, each slot covers all layers.
+                    total += n * get_physical_pool(pt, lg_id, pv.pool_idx).slot_bytes
         return total
 
     @staticmethod
@@ -905,7 +908,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._send_reqs[rid] = req
 
         chunk_start_pos, chunk_end_pos = req.py_last_context_chunk
-        tpb = self._kv_cache_manager.tokens_per_block
+        tpb = self._reuse_adapter.tokens_per_block
 
         # Include any reused prefix in the first transferred chunk.
         is_first_chunk = chunk_start_pos == req.prepopulated_prompt_len
@@ -923,10 +926,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         chunk_block_ids = []
         assert self._page_table is not None
         for lg, block_ids in zip(self._page_table.layer_groups, all_block_ids):
-            window_size = getattr(lg, "sliding_window_size", None)
-            if window_size is not None and window_size < req.prompt_len:
-                # SWA pages can leave the active window between chunks. Defer
-                # the group and send its complete final active window at once.
+            window_size = lg.live_token_window
+            if not lg.has_token_axis or (window_size is not None and window_size < req.prompt_len):
+                # Per-request state is only final once the whole prompt has
+                # been processed, and SWA pages can leave the active window
+                # between chunks. Defer such groups and send them whole with
+                # the final chunk.
                 chunk_block_ids.append(block_ids if is_last_chunk else block_ids[:0])
             else:
                 # _build_kv_write_meta derives the chunk's start token from list length

@@ -61,9 +61,9 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     get_non_empty_aux_indices,
 )
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-    MambaPolicy,
-    mamba_receiver_payload_bytes,
+from tensorrt_llm._torch.disaggregation.native.mixers.policy import (
+    state_payload_bytes,
+    validate_page_tables,
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
@@ -71,7 +71,6 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -1365,21 +1364,21 @@ class Sender(SenderBase):
         # Send ownership is per pool: replicated pools elect one fan-in
         # owner, sharded pools keep head-duplication routing.
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
-            if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
+            if not self._registrar.should_send_pool(peer_ri, self_lg, self_pi):
                 continue
 
             lg_info = extractor.page_table.layer_groups[self_lg]
             src_block_ids = src_block_ids_per_groups[self_lg]
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-            # Extract regions: STATE = per-layer ptrs, PAGED = per-block ptrs
-            if lg_info.kind == CacheKind.STATE:
+            # Extract slot base pointers. A per-request state group has one
+            # slot; a paged group has the (aligned) block list. Shard pairing
+            # was already decided by should_send_pool above.
+            if not lg_info.has_token_axis:
                 if src_block_ids.size == 0 or dst_block_ids.size == 0:
                     continue
-                if not MambaPolicy.is_paired(self._registrar.self_rank_info, peer_ri):
-                    continue
-                src_region = extractor.extract_slot(int(src_block_ids[0]), self_lg, self_pi)
-                dst_region = peer_extractor.extract_slot(int(dst_block_ids[0]), peer_lg, peer_pi)
+                src_region = extractor.extract(src_block_ids[:1], self_lg, self_pi)
+                dst_region = peer_extractor.extract(dst_block_ids[:1], peer_lg, peer_pi)
             else:
                 tpb = extractor.page_table.tokens_per_block
                 if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
@@ -1389,7 +1388,7 @@ class Sender(SenderBase):
                     # suffix alignment below degenerates to identity; block
                     # reuse is rejected under helix.
                     src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
-                window_size = getattr(lg_info, "sliding_window_size", None)
+                window_size = lg_info.live_token_window
 
                 # Block lists are the suffix of [..., slice_end); cached prefix
                 # is implicit in their size. token_start = (total_blocks - n) * tpb.
@@ -1417,7 +1416,7 @@ class Sender(SenderBase):
                 dst_block_ids = Sender._trim_receiver_window_head(
                     src_block_ids,
                     dst_block_ids,
-                    peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
+                    peer_window_size=peer_lg_info.live_token_window,
                     beam_width=task._beam_width,
                 )
                 src_beam0 = Sender._beam0_block_count(src_block_ids, total_blocks, task._beam_width)
@@ -2568,16 +2567,12 @@ class Receiver(ReceiverBase):
             slice_id=task.slice_id,
         )
 
-    @staticmethod
-    def _fanin_bounce_safe(
-        overlap: PeerOverlap,
-        peer_ri: RankInfo,
-        receiver_page_table: Optional[KVCachePageTable],
-    ) -> bool:
+    def _fanin_bounce_safe(self, overlap: PeerOverlap, peer_ri: RankInfo) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
         The split assumes every writer contributes the same size, which holds when:
-          * duplicate_head_factor == 1 -- else some ranks don't send KV yet still count in
-            expected_transfers, so the live writers overflow their slots;
+          * no sender-side replica election happens -- a sender view with more replicas than
+            our matching view elects one sender per destination, so some ranks send nothing yet
+            still count in expected_transfers and the live writers would overflow their slots;
           * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
             for PP fan-in, every overlapping stage must hold the same number of layers
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
@@ -2585,38 +2580,35 @@ class Receiver(ReceiverBase):
         Otherwise fall back to the per-fragment path (correct, just not coalesced).
         Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
         the mismatched case, so this only needs the count to split evenly."""
-        if overlap.duplicate_head_factor != 1:
-            return False
+        self_pt = self._registrar.self_extractor.page_table
+        peer_pt = getattr(peer_ri, "page_table", None)
+        pool_mapping = (
+            self._registrar.get_pool_mapping(peer_ri).items()
+            if self_pt is not None and peer_pt is not None
+            else ()
+        )
+        for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping:
+            self_pv = self_pt.layer_groups[self_lg].pool_views[self_pi]
+            peer_pv = peer_pt.layer_groups[peer_lg].pool_views[peer_pi]
+            # Replicated side caches are covered by the same rule: the sender
+            # elects one owner only when it holds more replicas than we do.
+            if peer_pv.num_replicas > self_pv.num_replicas:
+                return False
         if overlap.overlap_pp_size > 1:
             lpp = getattr(peer_ri, "layer_num_per_pp", None)
             if not lpp or len(lpp) < overlap.overlap_pp_size or len(set(lpp)) != 1:
                 return False
-        # Replicated pools (e.g. MiniMax M3 index-key) are sent by one elected
-        # fan-in owner only, so with multiple writers their contributions
-        # differ in size and the equal split is invalid. Inspect both endpoints:
-        # a masked PP stage may advertise no replicated view even though another
-        # stage owns one that is visible in the receiver's page table.
-        if len(overlap.ranks) > 1:
-            for page_table in (peer_ri.page_table, receiver_page_table):
-                if page_table is None:
-                    continue
-                for layer_group in page_table.layer_groups:
-                    for pool_view in getattr(layer_group, "pool_views", ()):
-                        if pool_view.mapper_kind == MapperKind.REPLICATED:
-                            return False
         return True
 
-    def _get_mamba_slot(self, req_info: RecvReqInfo) -> Optional[int]:
-        """Extract the mamba slot index from block_ids_per_layer_groups, or None."""
+    def _has_state_payload(self, req_info: RecvReqInfo) -> bool:
+        """Whether the receive request carries a slot for any per-request state group."""
         pt = self._registrar.self_extractor.page_table
         if pt is None:
-            return None
-        for lg_idx, lg in enumerate(pt.layer_groups):
-            if lg.kind == CacheKind.STATE:
-                block_ids = req_info.block_ids_per_layer_groups[lg_idx]
-                if block_ids.size > 0:
-                    return int(block_ids[0])
-        return None
+            return False
+        return any(
+            not lg.has_token_axis and req_info.block_ids_per_layer_groups[lg_idx].size > 0
+            for lg_idx, lg in enumerate(pt.layer_groups)
+        )
 
     def dispatch_task(self, task: KVRecvTask) -> None:
         params = task._params
@@ -2691,24 +2683,18 @@ class Receiver(ReceiverBase):
         allow_bounce = task.expected_transfers == 1 or (
             sender_dp_rank is not None
             and not cp_involved
-            and self._fanin_bounce_safe(
-                topo_overlap,
-                peer_infos,
-                self._registrar.self_extractor.page_table,
-            )
+            and self._fanin_bounce_safe(topo_overlap, peer_infos)
         )
         # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks,
         # so the bounce region must be sized for those bytes too.
         extra_bytes = 0
-        mamba_dst_slot = self._get_mamba_slot(receiver_req)
-        if mamba_dst_slot is not None:
+        if self._has_state_payload(receiver_req):
             if peer_infos.page_table is None:
                 allow_bounce = False  # cannot size the recurrent-state payload
             else:
-                extra_bytes = mamba_receiver_payload_bytes(
+                extra_bytes = state_payload_bytes(
                     sender_page_table=peer_infos.page_table,
                     receiver_page_table=self._registrar.self_extractor.page_table,
-                    dst_slot=mamba_dst_slot,
                 )
         bounced = allow_bounce and self._bounce.reserve(
             receiver_req, task.expected_transfers, extra_bytes=extra_bytes
@@ -2828,9 +2814,7 @@ class Receiver(ReceiverBase):
             # (handled in dispatch_task) so only requests targeting this peer
             # fail, and cached so later requests fail fast.
             try:
-                MambaPolicy.validate_peer_compatible(
-                    self._registrar.self_rank_info,
-                    sender_info,
+                validate_page_tables(
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )

@@ -2738,7 +2738,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """Map native cache roles to disaggregation mapper kinds.
 
         ``Role.ALL`` is the required fallback for roles without an explicit
-        entry. The default is the head-major (HND) ``INDEXED`` layout written
+        entry. The default is the head-major ``HND`` layout written
         by the TRTLLM attention kernels — correct for V1 and standard V2
         managers. ``Role.INDEX_KEY`` defaults to ``REPLICATED``: every
         index-key side cache shipped so far (DSA indexer-K on V1, MiniMax M3
@@ -2765,7 +2765,7 @@ class KVCacheManagerV2(BaseResourceManager):
         selects the layout at runtime must derive the mapping from that
         backend's configuration.
         """
-        return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
+        return {Role.ALL: MapperKind.HND, Role.INDEX_KEY: MapperKind.REPLICATED}
 
     @property
     def blocks_in_primary_pool(self) -> int:

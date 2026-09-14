@@ -17,15 +17,9 @@ from __future__ import annotations
 
 from typing import Dict, List, Set
 
-from .page import (
-    AttentionLayerGroup,
-    CacheKind,
-    KVCachePageTable,
-    LayerGroup,
-    MambaLayerGroup,
-    PhysicalPool,
-    PoolView,
-)
+import numpy as np
+
+from .page import KVCachePageTable, LayerGroup, PhysicalPool, PoolView
 
 # -------------------------------------------------------------------------
 # PhysicalPool helpers
@@ -149,14 +143,14 @@ def get_pool_view_global_layer_ids(pool_view: PoolView, layer_group: "LayerGroup
 # -------------------------------------------------------------------------
 
 
-def get_global_layer_ids(layer_group: AttentionLayerGroup) -> List[int]:
+def get_global_layer_ids(layer_group: LayerGroup) -> List[int]:
     """
     Ordered global layer IDs for *layer_group*
     """
     return [ll.global_layer_id for ll in layer_group.local_layers]
 
 
-def get_layer_group_num_layers(layer_group: AttentionLayerGroup) -> int:
+def get_layer_group_num_layers(layer_group: LayerGroup) -> int:
     """
     Number of layers in *layer_group*
     """
@@ -184,51 +178,37 @@ def get_physical_pool(page_table: KVCachePageTable, lg_idx: int, pool_idx: int) 
 def get_unique_pool_memory_descs(
     page_table: KVCachePageTable, device_id: int
 ) -> list[tuple[int, int, int, str]]:
-    """Return deduplicated (ptr, size, device_id, name) tuples for all physical pools."""
-    unique_pools: dict[tuple[int, int], int] = {}  # (ptr, size) -> index
-    pool_counter = 0
+    """Return deduplicated (ptr, size, device_id, name) tuples for all physical pools.
+
+    A pool's footprint follows the same addressing contract the extractor and
+    mappers use: ``slot_stride * (num_slots - 1) + extent``, where ``extent`` is
+    the furthest byte any referencing view touches inside a slot (at least
+    ``slot_bytes``). Views whose offsets encode a layer pitch (legacy V1
+    layer-major recurrent state) therefore register the whole layer-major
+    allocation; slot-spanning views register ``num_slots * slot_stride``.
+    Pools referenced from several layer groups are registered once.
+    """
+    footprints: dict[int, int] = {}  # base_address -> footprint bytes
+    order: list[int] = []
     for lg_idx, lg in enumerate(page_table.layer_groups):
-        if lg.kind == CacheKind.STATE:
-            assert isinstance(lg, MambaLayerGroup)
-            if lg.slot_major_layout:
-                # MambaHybridCacheManagerV2: roles may share one allocation
-                # (interleaved, equal sizes) or be separate (unequal sizes).
-                # Process lowest-base first so the covering region registers
-                # before higher-offset roles that fall inside it.
-                pools = sorted(
-                    (get_physical_pool(page_table, lg_idx, pv.pool_idx) for pv in lg.pool_views),
-                    key=lambda p: p.base_address,
-                )
-                for pool in pools:
-                    pool_size = pool.num_slots * pool.slot_stride_bytes
-                    if any(b <= pool.base_address < b + s for (b, s) in unique_pools):
-                        continue
-                    pool_key = (pool.base_address, pool_size)
-                    if pool_key not in unique_pools:
-                        unique_pools[pool_key] = pool_counter
-                        pool_counter += 1
+        for pv in lg.pool_views:
+            pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
+            extent = int(pool.slot_bytes)
+            if len(pv.buffer_entries):
+                entries_end = pv.buffer_entries["offset"].astype(np.int64) + pv.buffer_entries[
+                    "size"
+                ].astype(np.int64)
+                extent = max(extent, int(entries_end.max()))
+            size = int(pool.slot_stride_bytes) * (int(pool.num_slots) - 1) + extent
+            base = int(pool.base_address)
+            if base not in footprints:
+                order.append(base)
+                footprints[base] = size
             else:
-                # Layer-major (MambaHybridCacheManager): each role is a separate
-                # allocation. Register each: size = num_layers * layer_stride.
-                for pv in lg.pool_views:
-                    pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
-                    num_layers = len({int(e["local_layer_id"]) for e in pv.buffer_entries})
-                    pool_size = num_layers * pool.layer_stride_bytes
-                    pool_key = (pool.base_address, pool_size)
-                    if pool_key not in unique_pools:
-                        unique_pools[pool_key] = pool_counter
-                        pool_counter += 1
-        else:
-            # PAGED (attention): each pool view is an independent allocation
-            for pv in lg.pool_views:
-                pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
-                pool_key = (pool.base_address, pool.num_slots * pool.slot_stride_bytes)
-                if pool_key not in unique_pools:
-                    unique_pools[pool_key] = pool_counter
-                    pool_counter += 1
+                footprints[base] = max(footprints[base], size)
     return [
-        (pool_ptr, pool_size, device_id, f"kv_cache_memory_pool{idx}")
-        for (pool_ptr, pool_size), idx in unique_pools.items()
+        (base, footprints[base], device_id, f"kv_cache_memory_pool{idx}")
+        for idx, base in enumerate(order)
     ]
 
 
@@ -239,41 +219,42 @@ def get_unique_pool_memory_descs(
 
 def get_layer_to_layer_group(
     page_table: KVCachePageTable,
-    kind: CacheKind | None = None,
+    has_token_axis: bool | None = True,
 ) -> Dict[int, int]:
     """
     Build ``{global_layer_id: lg_idx}`` mapping.
 
-    When *kind* is ``None`` (legacy default), only PAGED layer groups are
-    indexed — this preserves backward compatibility with callers that
-    assume attention layers partition without overlap. When a specific kind
-    is given, only layer groups of that kind are indexed; within one kind,
-    every global_layer_id must belong to exactly one group. Peer matching
-    relies on this, so a duplicate raises instead of silently keeping the
-    last group.
+    Layer groups are filtered by whether they have a token axis (paged KV vs
+    per-request state): in hybrid models one global layer id may legitimately
+    appear in both a paged group and a state group, so peer matching scopes
+    the lookup to one class. ``True`` (default) indexes paged groups, ``False``
+    state groups, ``None`` all groups. Within the selected class every
+    global_layer_id must belong to exactly one group; a duplicate raises
+    instead of silently keeping the last group.
     """
-    if kind is None:
-        kind = CacheKind.PAGED
     out: Dict[int, int] = {}
     for lg_idx, lg in enumerate(page_table.layer_groups):
-        if lg.kind == kind:
-            for ll in lg.local_layers:
-                gid = int(ll.global_layer_id)
-                if gid in out:
-                    raise ValueError(
-                        f"global_layer_id {gid} appears in layer groups "
-                        f"{out[gid]} and {lg_idx}; layer groups must partition "
-                        f"a rank's layers (within kind {kind.name})"
-                    )
-                out[gid] = int(lg_idx)
+        if has_token_axis is not None and lg.has_token_axis != has_token_axis:
+            continue
+        for ll in lg.local_layers:
+            gid = int(ll.global_layer_id)
+            if gid in out:
+                raise ValueError(
+                    f"global_layer_id {gid} appears in layer groups "
+                    f"{out[gid]} and {lg_idx}; layer groups must partition "
+                    "a rank's layers (within one token-axis class)"
+                )
+            out[gid] = int(lg_idx)
     return out
 
 
+def _paged_groups(page_table: KVCachePageTable):
+    return ((i, lg) for i, lg in enumerate(page_table.layer_groups) if lg.has_token_axis)
+
+
 def get_num_layers(page_table: KVCachePageTable) -> int:
-    """
-    Total number of attention layers across all layer groups
-    """
-    return sum(len(lg.local_layers) for lg in page_table.layer_groups if lg.kind == CacheKind.PAGED)
+    """Total number of layers across paged (token-axis) layer groups."""
+    return sum(len(lg.local_layers) for _, lg in _paged_groups(page_table))
 
 
 def get_num_layer_groups(page_table: KVCachePageTable) -> int:
@@ -282,46 +263,35 @@ def get_num_layer_groups(page_table: KVCachePageTable) -> int:
 
 
 def get_pool_views(page_table: KVCachePageTable) -> List[List[PoolView]]:
-    """
-    Pool views per attention layer group
-    """
-    return [lg.pool_views for lg in page_table.layer_groups if lg.kind == CacheKind.PAGED]
+    """Pool views per paged layer group."""
+    return [lg.pool_views for _, lg in _paged_groups(page_table)]
 
 
 def get_total_pools(page_table: KVCachePageTable) -> int:
-    """Total pool-view count."""
-    return sum(len(lg.pool_views) for lg in page_table.layer_groups if lg.kind == CacheKind.PAGED)
+    """Total pool-view count over paged layer groups."""
+    return sum(len(lg.pool_views) for _, lg in _paged_groups(page_table))
 
 
 def get_total_buffer_entries(page_table: KVCachePageTable) -> int:
-    """Total buffer entries across all pools."""
+    """Total buffer entries across paged layer groups."""
     return sum(
-        get_num_buffer_entries(pv)
-        for lg in page_table.layer_groups
-        if lg.kind == CacheKind.PAGED
-        for pv in lg.pool_views
+        get_num_buffer_entries(pv) for _, lg in _paged_groups(page_table) for pv in lg.pool_views
     )
 
 
 def get_total_pool_bytes(page_table: KVCachePageTable) -> int:
-    """
-    Total allocated bytes across all physical pools
-    """
+    """Total allocated bytes across the physical pools of paged layer groups."""
     return sum(
         get_pool_bytes(get_physical_pool(page_table, lg_idx, pv.pool_idx))
-        for lg_idx, lg in enumerate(page_table.layer_groups)
-        if lg.kind == CacheKind.PAGED
+        for lg_idx, lg in _paged_groups(page_table)
         for pv in lg.pool_views
     )
 
 
 def get_total_slots(page_table: KVCachePageTable) -> int:
-    """
-    Total slot count across all physical pools
-    """
+    """Total slot count across the physical pools of paged layer groups."""
     return sum(
         get_physical_pool(page_table, lg_idx, pv.pool_idx).num_slots
-        for lg_idx, lg in enumerate(page_table.layer_groups)
-        if lg.kind == CacheKind.PAGED
+        for lg_idx, lg in _paged_groups(page_table)
         for pv in lg.pool_views
     )

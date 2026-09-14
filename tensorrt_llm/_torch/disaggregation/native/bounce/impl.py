@@ -240,7 +240,7 @@ class VmmBounceTransport(BounceTransport):
         False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
         must divide across the writers. ``extra_bytes`` is the non-paged payload the sender appends
         to the same coalesced write (mamba/KDA recurrent state, sized by the receiver via
-        ``mamba_receiver_payload_bytes``); the region must cover it or the write would overrun into the
+        ``state_payload_bytes``); the region must cover it or the write would overrun into the
         neighboring slot."""
         total = 0
         has_state_group = False
@@ -613,18 +613,19 @@ def decode_result_tail(message):
 def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:
     """Return transferred bytes per cache block for each layer group.
 
-    All distinct physical pools exposed by an attention group contribute to its
-    transfer size. Multiple logical views of the same physical pool contribute
-    only once. Non-attention groups retain a ``None`` placeholder so the result
-    remains aligned with receive-request layer-group indices.
+    All distinct physical pools exposed by a paged (token-axis) group
+    contribute to its transfer size. Multiple logical views of the same
+    physical pool contribute only once. Per-request state groups (no token
+    axis) retain a ``None`` placeholder so the result remains aligned with
+    receive-request layer-group indices; their bytes are accounted separately
+    via ``extra_bytes``.
     """
-    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
     from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 
     assert page_table is not None
     out: list[int | None] = []
     for lg_idx, lg in enumerate(page_table.layer_groups):
-        if lg.kind != CacheKind.PAGED:
+        if not lg.has_token_axis:
             out.append(None)
             continue
         pool_indices = {pool_view.pool_idx for pool_view in lg.pool_views}

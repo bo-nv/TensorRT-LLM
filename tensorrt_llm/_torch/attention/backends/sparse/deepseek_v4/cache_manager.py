@@ -986,6 +986,22 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             layers=layers,
         )
 
+    @property
+    def layer_keys(self) -> Dict[int, int]:
+        """Peer-matching key of every internal layer: ``(model_layer, attention_type)`` as one int.
+
+        DeepSeek-V4 registers several internal layers per model layer (one per
+        attention type), so ``pp_layers`` cannot identify an internal layer.
+        ``model_layer * num_attention_types + attention_type`` is collision-free
+        and, because it uses the full enum range rather than the types present
+        on this rank, identical for the same internal layer on every PP rank.
+        """
+        num_attn_types = max(t.value for t in DeepseekV4AttentionType) + 1
+        return {
+            int(layer_id): int(model_layer) * num_attn_types + int(attn_type.value)
+            for (model_layer, attn_type), layer_id in self._layer_attn_to_layer_id.items()
+        }
+
     def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:
         # Indexer compressor cache layout. Two modes are supported:
         #   - "fp8" (FP8 blockwise): 1 byte per value + 1 fp32 scale per 128

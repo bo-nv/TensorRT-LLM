@@ -19,11 +19,33 @@ from typing import List, Optional
 import msgpack
 
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_size_in_bytes
+
+
+@dataclass
+class AttentionInfo:
+    """Instance-level attention topology carried with RankInfo.
+
+    Shard geometry for transfers lives on the page table's PoolViews; this
+    record only keeps what instance-level decisions still need:
+    ``enable_attention_dp`` sizes the TP group used for rank overlap and aux
+    ownership, ``tokens_per_block`` gates helix block interleaving.
+    """
+
+    tokens_per_block: int
+    enable_attention_dp: bool
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AttentionInfo":
+        return cls(
+            tokens_per_block=int(data["tokens_per_block"]),
+            enable_attention_dp=bool(data["enable_attention_dp"]),
+        )
 
 
 @dataclass
@@ -73,19 +95,6 @@ class RankInfo:
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
         enable_attention_dp = m.enable_attention_dp
-        # Keep AttentionInfo on attention-free PP stages so it can still carry
-        # the attention-DP topology used by Mamba transfers.  A zero head count
-        # means that this rank has no local attention cache; AttentionPolicy
-        # must not perform head-ratio arithmetic for such ranks.
-        kv_heads_per_rank = next((h for h in kvm.num_kv_heads_per_layer if h > 0), 0)
-        # Eight is the smallest element count guaranteed to occupy whole bytes
-        # for every supported sub-byte cache dtype (including NVFP4).
-        bytes_for_eight_elements = get_size_in_bytes(8, kvm.dtype)
-        element_bytes = (
-            bytes_for_eight_elements // 8
-            if bytes_for_eight_elements % 8 == 0
-            else bytes_for_eight_elements / 8
-        )
         return cls(
             instance_name=instance_name,
             instance_rank=m.rank,
@@ -103,12 +112,8 @@ class RankInfo:
             self_endpoint="",
             transfer_engine_info=bytes(),
             attention=AttentionInfo(
-                kv_heads_per_rank=kv_heads_per_rank,
                 tokens_per_block=kvm.tokens_per_block,
-                dims_per_head=kvm.head_dim,
-                element_bytes=element_bytes,
                 enable_attention_dp=enable_attention_dp,
-                is_mla=kvm.kv_factor == 1,
             ),
             aux_meta=aux_buffer_meta,
             page_table=build_page_table_from_manager(kvm),

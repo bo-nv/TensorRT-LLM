@@ -13,11 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Wire-level description of one rank's transferable cache memory.
+
+A rank publishes its page table to its peers. It answers two questions and
+names no model family or cache type:
+
+* **Where is the memory?** :class:`PhysicalPool` (base, slot pitch, slot
+  count) and :attr:`PoolView.buffer_entries` (per-layer byte ranges inside a
+  slot). Every consumer addresses bytes as
+  ``pool.base_address + slot * pool.slot_stride_bytes + entry.offset``.
+* **How is it sharded?** :attr:`PoolView.layout` (:class:`RoleLayout`): how
+  many shards the role is split into across the parallel group, which shard
+  and replica this rank holds, and the granularity the bytes may be re-split
+  at. Peers compare layouts and derive byte ranges with integer arithmetic;
+  no side re-derives geometry from tensors or from the other side's parallel
+  configuration.
+
+:class:`LayerGroup` is the request-level unit: one slot list per request
+covers every view in the group. :attr:`LayerGroup.tokens_per_slot` says
+whether that list grows with the prompt or is a single per-request slot.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import FrozenSet, List, Optional
+from typing import FrozenSet, List, Optional, Tuple
 
 import numpy as np
 
@@ -31,80 +52,156 @@ BUFFER_ENTRY_DTYPE = np.dtype(
 
 
 class MapperKind(IntEnum):
-    """Transfer semantics of one physical pool's bytes.
+    """How one layer's region of a role may be cut when peers hold different shard counts.
 
-    Every PoolView carries ``buffer_entries`` listing
-    ``(local_layer_id, offset, size)`` per buffer; the view's exact layer
-    set always comes from those entries (a view may cover a subset of the
-    LG when V2 splits an LG into multiple pools by buffer-size class, or
-    when a role class exists only on some layers). The kind selects how
-    bytes move between heterogeneous topologies:
+    HND: The region (or each of its ``buffers_per_layer`` equal buffers) is a
+        contiguous run of shard units, so a finer-sharded peer's data is one
+        contiguous sub-range.
+    REPLICATED: Every rank holds identical bytes (``num_shards == 1``). Copied
+        whole; one sender is elected among the replicas.
+    NHD: Unit-minor storage ``[token][unit][...]``: a finer peer's sub-range is
+        contiguous only inside one token, so re-splitting emits one fragment
+        per ``(layer, buffer, token)``. Requires equal ``tokens_per_slot``.
+    SECTIONED: ``[Sec0|Sec1|...]``, each section sharded independently; sizes
+        come from :attr:`RoleLayout.section_bytes`.
 
-    INDEXED/HND: Head-major (HND) K/V — the layout written by the TRTLLM
-        attention kernels and the default for V1 and standard V2 managers.
-        Heterogeneous-head transfer selects one contiguous head-major range
-        per K/V buffer.
-    REPLICATED: The pool holds bytes that are identical on every TP rank
-        (MiniMax M3 index-key, DSA indexer K). Copied without KV-head
-        remapping using per-layer strides; fan-in routing elects one owning
-        sender per destination so each peer receives exactly one copy.
-    NHD: Ordinary K/V whose per-buffer storage is token-major
-        ``[token, head, dim]``. Heterogeneous-head transfer must select the
-        corresponding head slice inside every token rather than a single
-        contiguous head-major range.
-
-    A physical pool may hold roles of different kinds: V2 storage coalesces
-    buffers purely by ``(life_cycle, buffer size)``, so e.g. MiniMax M3's
-    replicated index-K shares the K/V pool at TP degrees where their
-    per-block sizes coincide. The page-table builder therefore emits one
-    PoolView per ``(physical pool, mapper kind)`` — a view covers exactly
-    the bytes of one role class, and its per-layer byte ranges come from
-    ``buffer_entries`` (offsets are per layer because another class may
-    interleave between layers; only the per-layer size is uniform, recorded
-    in ``bytes_per_layer``). View count per layer group is bounded by the
-    number of role classes, never by layer count.
-
-    Mamba state pools do not use this enum: Mamba's transfer is dispatched
-    through :class:`MambaPolicy` which hard-codes the ``is_conv`` switch and
-    bypasses the attention pool-matching path entirely.
+    A physical pool may hold roles of different layouts, so the page-table
+    builder emits one PoolView per ``(physical pool, RoleLayout)``.
     """
 
-    INDEXED = 0
-    HND = INDEXED
+    HND = 0
     REPLICATED = 1
     NHD = 2
-    SECTIONED = 3  # Sectioned layout: [Sec0|Sec1|...], each section independently TP-sharded
+    SECTIONED = 3
+
+
+@dataclass(frozen=True)
+class RoleLayout:
+    """How one role's bytes are sharded across the parallel group.
+
+    Built once per role by the page-table builder (``role_rules.py``) and
+    attached to every :class:`PoolView` of that role.
+
+    Fields:
+        mapper_kind: See :class:`MapperKind`.
+        num_shards: Number of *distinct* shards across the parallel group.
+            Ranks holding identical bytes are replicas, not extra shards.
+        shard_index: Which shard this rank holds.
+        num_replicas: How many ranks hold each shard.
+        replica_index: Which replica this rank is; used only to elect one
+            sender among ranks holding the same bytes.
+        shard_unit_bytes: Smallest unit a layer's region may be re-split at
+            for ``HND``/``NHD``; ``None`` when re-splitting is impossible.
+        section_bytes: Per-section byte sizes for ``SECTIONED``.
+        elem_dtype, elem_shape: Element type and topology-invariant shape of
+            one unit; peers only compare them for equality.
+    """
+
+    mapper_kind: MapperKind
+    num_shards: int = 1
+    shard_index: int = 0
+    num_replicas: int = 1
+    replica_index: int = 0
+    shard_unit_bytes: Optional[int] = None
+    section_bytes: Optional[Tuple[int, ...]] = None
+    elem_dtype: str = ""
+    elem_shape: Tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mapper_kind, MapperKind):
+            raise ValueError(f"Invalid disaggregation mapper kind {self.mapper_kind!r}")
+        if self.num_shards <= 0 or not (0 <= self.shard_index < self.num_shards):
+            raise ValueError(
+                f"RoleLayout shard_index {self.shard_index} out of range for "
+                f"num_shards {self.num_shards}"
+            )
+        if self.num_replicas <= 0 or not (0 <= self.replica_index < self.num_replicas):
+            raise ValueError(
+                f"RoleLayout replica_index {self.replica_index} out of range for "
+                f"num_replicas {self.num_replicas}"
+            )
+        if self.section_bytes is not None:
+            object.__setattr__(self, "section_bytes", tuple(int(b) for b in self.section_bytes))
+        object.__setattr__(self, "elem_shape", tuple(int(d) for d in self.elem_shape))
+        object.__setattr__(self, "elem_dtype", str(self.elem_dtype))
+        if self.mapper_kind == MapperKind.SECTIONED:
+            if not self.section_bytes:
+                raise ValueError("SECTIONED RoleLayout requires non-empty section_bytes")
+            if any(b <= 0 for b in self.section_bytes):
+                raise ValueError("RoleLayout section_bytes must all be positive")
+        elif self.section_bytes is not None:
+            raise ValueError(
+                f"section_bytes is only valid for SECTIONED, got {self.mapper_kind.name}"
+            )
+        if self.mapper_kind == MapperKind.REPLICATED:
+            if self.num_shards != 1:
+                raise ValueError("REPLICATED RoleLayout must have num_shards == 1")
+            if self.shard_unit_bytes is not None:
+                raise ValueError("REPLICATED RoleLayout must not declare shard_unit_bytes")
+        if self.shard_unit_bytes is not None and self.shard_unit_bytes <= 0:
+            raise ValueError("RoleLayout shard_unit_bytes must be positive")
+
+    # ---- wire ---------------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        return {
+            "mapper_kind": int(self.mapper_kind),
+            "num_shards": int(self.num_shards),
+            "shard_index": int(self.shard_index),
+            "num_replicas": int(self.num_replicas),
+            "replica_index": int(self.replica_index),
+            "shard_unit_bytes": (
+                int(self.shard_unit_bytes) if self.shard_unit_bytes is not None else None
+            ),
+            "section_bytes": (
+                [int(b) for b in self.section_bytes] if self.section_bytes is not None else None
+            ),
+            "elem_dtype": self.elem_dtype,
+            "elem_shape": [int(d) for d in self.elem_shape],
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "RoleLayout":
+        return RoleLayout(
+            MapperKind(int(data["mapper_kind"])),
+            num_shards=int(data.get("num_shards", 1)),
+            shard_index=int(data.get("shard_index", 0)),
+            num_replicas=int(data.get("num_replicas", 1)),
+            replica_index=int(data.get("replica_index", 0)),
+            shard_unit_bytes=(
+                int(data["shard_unit_bytes"]) if data.get("shard_unit_bytes") is not None else None
+            ),
+            section_bytes=(
+                tuple(int(b) for b in data["section_bytes"])
+                if data.get("section_bytes") is not None
+                else None
+            ),
+            elem_dtype=str(data.get("elem_dtype", "")),
+            elem_shape=tuple(int(d) for d in data.get("elem_shape", ())),
+        )
 
 
 @dataclass
 class PhysicalPool:
-    """Affine view of a physical pool over logical layers and slots.
+    """One physical memory pool addressed by slot.
 
-    ``slot_bytes`` is the transferable payload for one ``(layer, slot)`` and
-    ``num_slots`` is the number of logical slots. The payload address is
-    ``base_address + layer * layer_stride_bytes + slot * slot_stride_bytes``.
-    The strides describe the physical layout independently of payload size and
-    slot count. Their defaults describe dense layer-major storage, where
-    ``slot_stride_bytes == slot_bytes`` and
-    ``layer_stride_bytes == num_slots * slot_stride_bytes``. V2 Mamba supplies
-    both explicitly for its slot-major, role-interleaved pools.
+    ``num_slots`` slots start at ``base_address`` with pitch
+    ``slot_stride_bytes`` (defaults to ``slot_bytes``). Where a layer's bytes
+    sit relative to the slot start comes from the ``buffer_entries`` offsets
+    of the :class:`PoolView` referencing this pool; those offsets may exceed
+    ``slot_bytes`` when the allocation is layer-major.
     """
 
     base_address: int  # uint64
     slot_bytes: int
     num_slots: int
     slot_stride_bytes: Optional[int] = None
-    layer_stride_bytes: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.slot_stride_bytes is None:
             self.slot_stride_bytes = self.slot_bytes
-        if self.layer_stride_bytes is None:
-            self.layer_stride_bytes = self.num_slots * self.slot_stride_bytes
         if self.slot_stride_bytes < self.slot_bytes:
             raise ValueError("slot_stride_bytes must be greater than or equal to slot_bytes")
-        if self.layer_stride_bytes < self.slot_bytes:
-            raise ValueError("layer_stride_bytes must be greater than or equal to slot_bytes")
 
     def to_dict(self) -> dict:
         return {
@@ -112,7 +209,6 @@ class PhysicalPool:
             "slot_bytes": int(self.slot_bytes),
             "num_slots": int(self.num_slots),
             "slot_stride_bytes": int(self.slot_stride_bytes),
-            "layer_stride_bytes": int(self.layer_stride_bytes),
         }
 
     @staticmethod
@@ -124,11 +220,6 @@ class PhysicalPool:
             slot_stride_bytes=(
                 int(data["slot_stride_bytes"])
                 if data.get("slot_stride_bytes") is not None
-                else None
-            ),
-            layer_stride_bytes=(
-                int(data["layer_stride_bytes"])
-                if data.get("layer_stride_bytes") is not None
                 else None
             ),
         )
@@ -169,41 +260,69 @@ class LocalLayer:
 
 @dataclass
 class PoolView:
-    """
-    Per-layer-group view of a physical pool (slot layout for this life cycle).
+    """One role class's bytes inside a physical pool, for one layer group.
 
     Fields:
         pool_idx: Index of the physical pool within its pool group.
         buffer_entries: Structured array using ``BUFFER_ENTRY_DTYPE``. Each
             entry records a buffer's ``local_layer_id`` and its byte ``offset``
             and ``size`` within the pool slot.
-        pool_role: Set of native role-name strings (whatever the cache manager
-            uses, e.g. ``"key"`` / ``"value"`` / ``"deepseek_v4_swa"``) that
-            live in this pool. Used as the *equivalence label* for peer-to-peer
-            pool matching: two pools match iff their ``pool_role`` frozensets
-            are equal. Disagg never enumerates the role-name vocabulary —
-            adding a new role on the manager side requires no disagg change.
-        mapper_kind: Closed-set discriminator for picking the Mapper family.
+        pool_role: Set of the manager's role-name strings living in this
+            view. Two peer views match iff their ``pool_role`` sets are equal;
+            the transfer code never enumerates the vocabulary.
+        layout: This rank's :class:`RoleLayout` for the role class.
         bytes_per_layer: Uniform byte size of one layer's region within the
-            slot. The per-layer *offsets* live in ``buffer_entries``; only
-            the size is uniform, because a slot may interleave other role
-            classes between layers, making the layer stride non-uniform.
-            Set for every kind; ``None`` only in tables serialized by older
-            builders, where consumers re-derive it from the entries.
+            slot; the per-layer offsets live in ``buffer_entries``.
+
+    A layer's bytes for slot ``s`` live at ``pool.base_address + s *
+    pool.slot_stride_bytes + entry.offset``.
     """
 
     pool_idx: int
     buffer_entries: np.ndarray  # dtype=BUFFER_ENTRY_DTYPE
     pool_role: FrozenSet[str] = field(default_factory=frozenset)
-    mapper_kind: MapperKind = MapperKind.INDEXED
+    layout: RoleLayout = field(default_factory=lambda: RoleLayout(MapperKind.HND))
     bytes_per_layer: Optional[int] = None
+
+    # Read-through accessors for the layout fields consumers use most.
+    @property
+    def mapper_kind(self) -> MapperKind:
+        return self.layout.mapper_kind
+
+    @property
+    def num_shards(self) -> int:
+        return self.layout.num_shards
+
+    @property
+    def shard_index(self) -> int:
+        return self.layout.shard_index
+
+    @property
+    def num_replicas(self) -> int:
+        return self.layout.num_replicas
+
+    @property
+    def replica_index(self) -> int:
+        return self.layout.replica_index
+
+    @property
+    def shard_unit_bytes(self) -> Optional[int]:
+        return self.layout.shard_unit_bytes
+
+    @property
+    def section_bytes(self) -> Optional[Tuple[int, ...]]:
+        return self.layout.section_bytes
+
+    @property
+    def shards(self) -> Tuple[int, int]:
+        return self.layout.num_shards, self.layout.shard_index
 
     def to_dict(self) -> dict:
         return {
             "pool_idx": int(self.pool_idx),
             "buffer_entries": self.buffer_entries.tolist(),
             "pool_role": sorted(self.pool_role),
-            "mapper_kind": int(self.mapper_kind),
+            "layout": self.layout.to_dict(),
             "bytes_per_layer": (
                 int(self.bytes_per_layer) if self.bytes_per_layer is not None else None
             ),
@@ -211,137 +330,77 @@ class PoolView:
 
     @staticmethod
     def from_dict(data: dict) -> "PoolView":
-        raw = data.get("buffer_entries", [])
         # msgpack deserializes tuples as lists; np.array requires tuples for
         # structured dtypes (enforced in numpy >=2.0), so convert explicitly.
         return PoolView(
             pool_idx=int(data["pool_idx"]),
             buffer_entries=np.array(
-                [tuple(row) for row in raw],
+                [tuple(row) for row in data.get("buffer_entries", [])],
                 dtype=BUFFER_ENTRY_DTYPE,
             ),
             pool_role=frozenset(data["pool_role"]),
-            mapper_kind=MapperKind(int(data["mapper_kind"])),
+            layout=RoleLayout.from_dict(data["layout"]),
             bytes_per_layer=(
                 int(data["bytes_per_layer"]) if data.get("bytes_per_layer") is not None else None
             ),
         )
 
 
-class CacheKind(IntEnum):
-    """How region IDs in block_ids_per_layer_groups are interpreted.
-
-    PAGED: multiple block IDs per request (attention KV cache).
-           Extraction: per-block base pointers. Alignment: window/beam/SWA.
-    STATE: single slot ID per request (recurrent state, e.g. mamba).
-           Extraction: per-layer pointers within one slot. No block alignment.
-    """
-
-    PAGED = 0
-    STATE = 1
-
-
 @dataclass
 class LayerGroup:
-    """Base class for one life cycle / layer-group.
+    """One life cycle: the set of views a single per-request slot list covers.
 
-    Shared structure:
-      - kind: how this group's region IDs are interpreted (PAGED vs STATE)
-      - pool_group_idx: index into KVCachePageTable.pool_groups
-      - local_layers: local ↔ global layer ID mapping
-      - pool_views: logical views into pool_groups[pool_group_idx].pools
+    Fields:
+        pool_group_idx: Index into ``KVCachePageTable.pool_groups``.
+        local_layers: Local ↔ global layer id mapping; peers match layer
+            groups by global-id overlap.
+        pool_views: Logical views into ``pool_groups[pool_group_idx].pools``.
+        tokens_per_slot: Tokens covered by one slot when the request's slot
+            list grows with the prompt. ``None`` means the request owns exactly
+            one slot regardless of length, so no token-range arithmetic
+            applies to this group.
+        live_token_window: When set, only the slots covering the most recent
+            ``live_token_window`` tokens hold valid data; older slots are
+            skipped. Only meaningful with a token axis.
     """
 
     pool_group_idx: int
-    kind: CacheKind = CacheKind.PAGED
     local_layers: List[LocalLayer] = field(default_factory=list)
     pool_views: List[PoolView] = field(default_factory=list)
+    tokens_per_slot: Optional[int] = None
+    live_token_window: Optional[int] = None
 
-    def to_dict(self) -> dict:
-        raise NotImplementedError
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "LayerGroup":
-        kind = int(data["kind"])
-        if kind == CacheKind.PAGED:
-            return AttentionLayerGroup.from_dict(data)
-        elif kind == CacheKind.STATE:
-            return MambaLayerGroup.from_dict(data)
-        raise ValueError(f"Unknown layer group kind: {kind}")
-
-
-@dataclass
-class AttentionLayerGroup(LayerGroup):
-    """Layer group for attention KV cache."""
-
-    kv_head_num_per_rank: int = 0
-    sliding_window_size: Optional[int] = None
+    @property
+    def has_token_axis(self) -> bool:
+        return self.tokens_per_slot is not None
 
     def to_dict(self) -> dict:
         return {
-            "kind": int(self.kind),
             "pool_group_idx": int(self.pool_group_idx),
-            "kv_head_num_per_rank": int(self.kv_head_num_per_rank),
-            "sliding_window_size": self.sliding_window_size,
             "local_layers": [ll.to_dict() for ll in self.local_layers],
             "pool_views": [pv.to_dict() for pv in self.pool_views],
+            "tokens_per_slot": (
+                int(self.tokens_per_slot) if self.tokens_per_slot is not None else None
+            ),
+            "live_token_window": (
+                int(self.live_token_window) if self.live_token_window is not None else None
+            ),
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "AttentionLayerGroup":
+    def from_dict(cls, data: dict) -> "LayerGroup":
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
             local_layers=[LocalLayer.from_dict(x) for x in data.get("local_layers", [])],
             pool_views=[PoolView.from_dict(pv) for pv in data.get("pool_views", [])],
-            kv_head_num_per_rank=int(data["kv_head_num_per_rank"]),
-            sliding_window_size=data.get("sliding_window_size"),
-        )
-
-
-MAMBA_CONV_ROLE = frozenset({"mamba_conv"})
-MAMBA_SSM_ROLE = frozenset({"mamba_ssm"})
-
-
-@dataclass
-class MambaLayerGroup(LayerGroup):
-    """Layer group for Mamba SSM states.
-
-    Pools are accessed the same way as attention:
-        pool_groups[pool_group_idx].pools[pool_view.pool_idx]
-    where pool_idx=0 is conv, pool_idx=1 is ssm.
-    """
-
-    conv_section_bytes: Optional[List[int]] = None
-    ssm_bytes_per_head: Optional[int] = None
-    slot_major_layout: bool = False
-
-    def __post_init__(self) -> None:
-        self.kind = CacheKind.STATE
-
-    def to_dict(self) -> dict:
-        return {
-            "kind": int(self.kind),
-            "pool_group_idx": int(self.pool_group_idx),
-            "local_layers": [ll.to_dict() for ll in self.local_layers],
-            "pool_views": [pv.to_dict() for pv in self.pool_views],
-            "conv_section_bytes": self.conv_section_bytes,
-            "ssm_bytes_per_head": self.ssm_bytes_per_head,
-            "slot_major_layout": self.slot_major_layout,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "MambaLayerGroup":
-        return cls(
-            pool_group_idx=int(data["pool_group_idx"]),
-            local_layers=[LocalLayer.from_dict(x) for x in data["local_layers"]],
-            pool_views=[PoolView.from_dict(pv) for pv in data["pool_views"]],
-            conv_section_bytes=[int(x) for x in data["conv_section_bytes"]]
-            if data.get("conv_section_bytes")
-            else None,
-            ssm_bytes_per_head=int(data["ssm_bytes_per_head"])
-            if data.get("ssm_bytes_per_head")
-            else None,
-            slot_major_layout=bool(data.get("slot_major_layout", False)),
+            tokens_per_slot=(
+                int(data["tokens_per_slot"]) if data.get("tokens_per_slot") is not None else None
+            ),
+            live_token_window=(
+                int(data["live_token_window"])
+                if data.get("live_token_window") is not None
+                else None
+            ),
         )
 
 
