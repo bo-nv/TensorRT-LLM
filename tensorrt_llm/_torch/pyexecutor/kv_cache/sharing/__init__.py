@@ -55,7 +55,13 @@ __all__ = [
 ]
 
 
-def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: StagingOptions) -> Lender:
+def attach_lender(
+    manager: "KVCacheManagerV2",
+    *,
+    scope: bytes,
+    staging: StagingOptions,
+    share_count: _typing.Optional[int] = None,
+) -> Lender:
     """Attach the manager's one lender, which relays whole blocks through host staging.
 
     The lender copies blocks between a request's device pages and host slots on the manager's
@@ -159,13 +165,19 @@ def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: Staging
             lend no LoRA request by name or take different scopes. The framework's assembly builds
             it from its configuration, so no backend guesses which settings it needs.
         staging: The staging size, in whole fetches.
+        share_count: The number of equal head ranges a layer group's content is named in, or
+            ``None`` for this rank's own share, as without it. Instances sharing names across
+            tensor-parallel sizes take the same value, which each size divides into: every rank
+            then names each of its head ranges on its own, a view lends one row per range, block
+            by block, and a block entry arrives when all of its rows did. A layer group every rank
+            holds alike stays one share. Instances with different values share no name.
 
     Returns:
         The lender, installed on ``manager`` for the manager's life.
 
     Raises:
         TypeError: ``manager`` is not a ``KVCacheManagerV2`` or has no mapping, ``scope`` is not
-            ``bytes``, or ``staging`` is not ``StagingOptions``.
+            ``bytes``, ``staging`` is not ``StagingOptions``, or ``share_count`` is not an ``int``.
         ValueError: A lender is attached already; the manager is context-parallel (Helix included,
             ``mapping.cp_size > 1``) or pipeline-parallel (``mapping.pp_size > 1``), holds recurrent
             state, commits no blocks (block reuse off, or a draft manager without joint reuse),
@@ -175,7 +187,11 @@ def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: Staging
             (``is_sparse``), whose read-only pages a cache can lock in host memory, though sparse
             attention whose buffers are not marked sparse is not refused by this; its layer groups,
             layer configs and declarations do not agree; it has no pages to stage; ``scope`` is
-            longer than 65535 bytes; ``staging.max_bytes`` is below one fetch. One-model Eagle and
+            longer than 65535 bytes; ``staging.max_bytes`` is below one fetch; ``share_count`` is
+            not positive, this rank's share does not divide into it, or a layer group it splits
+            has a buffer that is not head-major, one this rank does not transfer, one with its own
+            tokens per block, one whose head count it does not divide, or slot bytes no buffer
+            covers. One-model Eagle and
             MTP-Eagle read 1 prompt token ahead, vanilla MTP its draft length, and the check reads
             the manager, not ``is_draft``, so it refuses draft layers sharing the target's manager,
             a joint-reuse draft pool, and the target's manager of such a draft whose layers live
@@ -188,4 +204,4 @@ def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: Staging
     """
     from ._lender import _attach_staging as _attach
 
-    return _attach(manager, scope=scope, staging=staging)
+    return _attach(manager, scope=scope, staging=staging, share_count=share_count)

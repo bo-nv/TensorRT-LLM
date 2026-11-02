@@ -115,8 +115,10 @@ class LayerGroupBlocks:
     """One layer group's lent KV blocks, described by aligned read-only arrays.
 
     Entry ``i`` describes this rank's KV for logical token block ``block_ordinals[i]`` across the
-    layers in this group, not a token tensor row or a physical page. Entries need not have
-    consecutive ordinals or addresses. Placement fields are either all given or all ``None``.
+    layers in this group, not a token tensor row or a physical page; with ``share_count`` it is one
+    head range of that KV, and a block's ranges are consecutive entries sharing its ordinal.
+    Entries need not have consecutive ordinals or addresses. Placement fields are either all given
+    or all ``None``.
 
     Equal object keys mean interchangeable bytes under the scope and caller obligations of
     ``attach_lender``. Keys are opaque identities, not payload checksums. Their format is not API,

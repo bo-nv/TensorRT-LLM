@@ -105,7 +105,14 @@ from tensorrt_llm.logger import logger
 from . import _manager, _ranges
 from ._fetch_ledger import _FetchLedger
 from ._identity import Identity
-from ._layout import ManagerLayout, derive_layout, layout_id
+from ._layout import (
+    ManagerLayout,
+    derive_layout,
+    group_buffers,
+    layout_id,
+    share_layout,
+    share_splits,
+)
 from ._slots import SlotQueue, SlotRuns, slot_counts
 from ._types import LayerGroupBlocks, LeaseView, MemoryRegion, ResumeBounds, StagingOptions
 
@@ -287,8 +294,38 @@ def _check_connector(manager: KVCacheManagerV2) -> None:
         )
 
 
+def _share_segments(
+    layout: ManagerLayout, lg: int, parts: int
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Where a staging page of layer group ``lg``, split into ``parts`` shares, takes its bytes from
+    a device page: ``(offset in the staging page, position of the device pool, offset in that
+    pool's slot, bytes)`` in staging order. Share ``s`` fills ``[s * page / parts, (s + 1) * page /
+    parts)`` of the staging page with, of each buffer in pool and slot order, the ``s``-th of its
+    ``parts`` equal head ranges."""
+    g = int(layout.pool_group_of[lg])
+    position = {int(pool.index): i for i, pool in enumerate(layout.device_pools[g])}
+    buffers = group_buffers(layout, lg)
+    out = []
+    offset = 0
+    for share in range(parts):
+        for b in buffers:
+            piece = int(b.size) // parts
+            out.append((offset, position[int(b.pool[1])], int(b.offset) + share * piece, piece))
+            offset += piece
+    if offset != int(layout.page_bytes[g]):
+        raise ValueError(
+            f"layer group {lg}: its shares hold {offset} bytes of a {layout.page_bytes[g]}-byte page"
+        )
+    return tuple(out)
+
+
 def _attach_staging(
-    manager: KVCacheManagerV2, *, scope: bytes, staging: StagingOptions, cls: type | None = None
+    manager: KVCacheManagerV2,
+    *,
+    scope: bytes,
+    staging: StagingOptions,
+    share_count: int | None = None,
+    cls: type | None = None,
 ) -> Staging:
     """``attach_lender`` with the lender class as a parameter (``Staging`` when ``None``), so a
     test can attach a subclass that breaks one rule."""
@@ -300,8 +337,14 @@ def _attach_staging(
         raise TypeError(f"scope must be bytes, got {type(scope).__name__}")
     if not isinstance(staging, StagingOptions):
         raise TypeError(f"staging must be StagingOptions, got {type(staging).__name__}")
+    if share_count is not None and (
+        isinstance(share_count, bool) or not isinstance(share_count, int)
+    ):
+        raise TypeError(f"share_count must be an int or None, got {type(share_count).__name__}")
+    splits = share_splits(layout, share_count)
+    parts = {int(layout.pool_group_of[lg]): split[2] for lg, split in enumerate(splits)}
     counts = slot_counts(layout, staging)
-    identity = Identity(scope, layout_id(layout.layout), layout.layers, layout.shards)
+    identity = Identity(scope, layout_id(share_layout(layout.layout, parts)), layout.layers, splits)
     slots = {g: int(counts.get(g, 0)) for g in layout.pool_groups}
     sizes = {g: slots[g] * int(layout.page_bytes[g]) for g in layout.pool_groups}
     # TODO: an exception after the allocation keeps the staging memory, and the page-index buffer
@@ -313,9 +356,17 @@ def _attach_staging(
     for g in layout.pool_groups:
         groups = tuple(lg for lg, pg in enumerate(layout.pool_group_of) if pg == g)
         layout_label = identity.region_label(groups)
+        # A staging page holds a block's shares back to back, so the region lends one slot per
+        # share: ``parts[g]`` slots per page.
+        share = parts.get(g, 1)
         regions.append(
             MemoryRegion(
-                layout_label, base + offset, sizes[g], int(layout.page_bytes[g]), slots[g], groups
+                layout_label,
+                base + offset,
+                sizes[g],
+                int(layout.page_bytes[g]) // share,
+                slots[g] * share,
+                groups,
             )
         )
         offset += sizes[g]
@@ -427,6 +478,15 @@ class Staging:
         # Only the keep list holds the staging memory strongly; this finds it there at shutdown.
         self._memory_ref = memory
         self._region_index_of_pool_group = {g: i for i, g in enumerate(layout.pool_groups)}
+        # The shares of each layer group's content a block entry holds, each a row of a view.
+        self._parts = tuple(identity.parts(lg) for lg in range(layout.num_layer_groups))
+        self._parts_of_pool_group = {
+            int(layout.pool_group_of[lg]): parts for lg, parts in enumerate(self._parts)
+        }
+        self._share_segments = tuple(
+            _share_segments(layout, lg, parts) if parts > 1 else ()
+            for lg, parts in enumerate(self._parts)
+        )
         self._any_window = any(w is not None for w in layout.windows)
         # The fetch records and the resume_bounds they give. The ledger asks this lender whether a
         # copy completed through a weak reference, so no reference cycle keeps the lender, or a
@@ -1128,6 +1188,11 @@ class Staging:
         """Copy the marked entries whose page is still the one lent into the request's pages. The
         fetch stays abandoned until that copy is queued without error; then its entries add to the
         cache's deliveries."""
+        # A view holds a row per share; a block entry arrived when every share of it did.
+        masks = [
+            mask.reshape(-1, self._parts[blocks.layer_group_index]).all(axis=1)
+            for blocks, mask in zip(lease._view.groups, masks)
+        ]
         fetch = lease._fetch
         current = self._ledger._take_out_fetch(lease, fetch)
         kv = _manager.kv_of(self._manager_ref(), lease._request_id)
@@ -1235,18 +1300,27 @@ class Staging:
             cursor[g] = offset + len(block_ordinals)
 
     def _build_view(self, entries: _LentBlockEntries, reuse_keys: list[np.ndarray]) -> LeaseView:
+        """One row per share of each block entry, block-major: a block entry whose layer group
+        this rank holds in ``parts`` shares is ``parts`` rows, its staging page's shares in order."""
         groups = []
         for lg, block_ordinals, lg_keys, slots in zip(
             entries.layer_group_indices, entries.block_ordinals, reuse_keys, entries.staging_slots
         ):
-            index = self._region_index_of_pool_group[int(self._layout.pool_group_of[lg])]
+            g = int(self._layout.pool_group_of[lg])
+            index = self._region_index_of_pool_group[g]
             region = self._regions[index]
+            parts = self._parts[lg]
+            pages = region.address + slots * int(self._layout.page_bytes[g])
+            if parts > 1:
+                shares = np.arange(parts, dtype=np.int64) * region.slot_bytes
+                pages = (pages[:, None] + shares[None, :]).reshape(-1)
+                block_ordinals = np.repeat(block_ordinals, parts)
             groups.append(
                 LayerGroupBlocks(
                     lg,
                     block_ordinals,
                     object_keys=self._object_keys(lg, lg_keys),
-                    addresses=region.address + slots * region.slot_bytes,
+                    addresses=pages,
                     region_index=index,
                 )
             )
@@ -1255,32 +1329,52 @@ class Staging:
     def _copy_segments(
         self, entries: _LentBlockEntries, mask: list[np.ndarray] | None = None
     ) -> list[list[int]]:
-        """``[staging address, device address, bytes]`` for every pool of every row ``mask`` keeps
-        (one boolean array per layer group; ``None``: every row), by device pool group. Segments
-        that continue each other on both sides are merged."""
+        """``[staging address, device address, bytes]`` for every pool of every block entry ``mask``
+        keeps (one boolean array per layer group; ``None``: every entry), by device pool group; for
+        a layer group held in several shares, one per buffer and share instead. Segments that
+        continue each other on both sides are merged."""
         by_group: dict[int, list[int]] = {}
         for i, lg in enumerate(entries.layer_group_indices):
             by_group.setdefault(int(self._layout.pool_group_of[lg]), []).append(i)
         out: list[list[int]] = []
+
+        def add(host: int, device: int, nbytes: int) -> None:
+            last = out[-1] if out else None
+            if last and last[0] + last[2] == host and last[1] + last[2] == device:
+                last[2] += nbytes
+            else:
+                out.append([host, device, nbytes])
+
         for g, members in by_group.items():
+            region = self._regions[self._region_index_of_pool_group[g]]
+            page = int(self._layout.page_bytes[g])
+            pools = self._layout.device_pools[g]
+            if self._parts_of_pool_group[g] > 1:
+                # A staging page holds the block's shares back to back, each the share's head
+                # range of every buffer, so a row copies in one segment per buffer and share.
+                for i in members:
+                    dev, stg = entries.device_pages[i], entries.staging_slots[i]
+                    if mask is not None:
+                        keep = np.asarray(mask[i], dtype=bool)
+                        dev, stg = dev[keep], stg[keep]
+                    segments = self._share_segments[entries.layer_group_indices[i]]
+                    for d, t in zip(dev.tolist(), stg.tolist()):
+                        for host, position, offset, nbytes in segments:
+                            pool = pools[position]
+                            device = int(pool.base) + d * int(pool.slot_bytes) + offset
+                            add(region.address + t * page + host, device, nbytes)
+                continue
             dev = np.concatenate([entries.device_pages[i] for i in members])
             stg = np.concatenate([entries.staging_slots[i] for i in members])
             if mask is not None:
                 keep = np.concatenate([np.asarray(mask[i], dtype=bool) for i in members])
                 dev, stg = dev[keep], stg[keep]
-            region = self._regions[self._region_index_of_pool_group[g]]
-            # A staging slot holds the device pools' slots back to back in pool order.
+            # A staging page holds the device pools' slots back to back in pool order.
             offset = 0
-            for pool in self._layout.device_pools[g]:
+            for pool in pools:
                 width = int(pool.slot_bytes)
                 for d, t in zip(dev.tolist(), stg.tolist()):
-                    host = region.address + t * region.slot_bytes + offset
-                    device = int(pool.base) + d * width
-                    last = out[-1] if out else None
-                    if last and last[0] + last[2] == host and last[1] + last[2] == device:
-                        last[2] += width
-                    else:
-                        out.append([host, device, width])
+                    add(region.address + t * page + offset, int(pool.base) + d * width, width)
                 offset += width
         return out
 

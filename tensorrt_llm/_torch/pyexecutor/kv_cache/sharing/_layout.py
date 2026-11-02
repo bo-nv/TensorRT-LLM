@@ -574,3 +574,125 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
         page_bytes={g: sum(p.slot_bytes for p in pools) for g, pools in device_pools.items()},
         device_pools=device_pools,
     )
+
+
+def group_buffers(layout: ManagerLayout, lg: int) -> list[BufferDesc]:
+    """The buffers of local layer group ``lg`` in its pool group's slot, in pool, then slot order."""
+    g = int(layout.pool_group_of[lg])
+    layers = set(layout.layers[lg])
+    found = [b for b in layout.layout.buffers if b.pool[0] == g and b.layer in layers]
+    return sorted(found, key=lambda b: (b.pool[1], b.offset))
+
+
+def _check_splits(b: BufferDesc, parts: int) -> None:
+    """``ValueError`` unless buffer ``b`` splits by head into ``parts`` ranges, each contiguous."""
+    heads = b.geometry.num_heads
+    if (
+        b.mapper is not BufferMapper.INDEXED
+        or not b.transfer
+        or int(b.expansion) != 1
+        or heads is None
+        or heads % parts
+    ):
+        raise ValueError(
+            f"buffer ({b.layer}, {b.role}) cannot be split by head into {parts} shares: "
+            f"mapper {b.mapper.name}, transfer {b.transfer}, expansion {b.expansion}, "
+            f"{heads} heads"
+        )
+
+
+def share_splits(
+    layout: ManagerLayout, share_count: int | None
+) -> tuple[tuple[int, int, int], ...]:
+    """Per local layer group, the ``(count, first, parts)`` shares its content is named by: this
+    rank holds the ``parts`` shares of ``count`` from ``first``, each one object.
+
+    Without ``share_count``, each layer group is this rank's own share, ``(count, index, 1)``. With
+    it, a layer group of head-major buffers is named in ``share_count`` equal head ranges, the same
+    names for the same heads on ranks of every tensor-parallel size whose share ``share_count``
+    divides into; a layer group whose content every rank holds alike (replicated buffers) stays
+    one share. ``ValueError`` for a non-positive ``share_count``, one this rank's share does not
+    divide into, a buffer that does not split by head into contiguous ranges, a slot with bytes no
+    buffer covers, or layer groups on one pool group holding different numbers of shares."""
+    if share_count is None:
+        return tuple((int(count), int(index), 1) for count, index in layout.shards)
+    share_count = int(share_count)
+    if share_count < 1:
+        raise ValueError(f"share_count must be positive, got {share_count}")
+    out = []
+    parts_of_pool_group: dict[int, int] = {}
+    for lg, (count, index) in enumerate(layout.shards):
+        buffers = group_buffers(layout, lg)
+        if all(b.mapper is BufferMapper.REPLICATED for b in buffers if b.transfer):
+            out.append((int(count), int(index), 1))
+            parts = 1
+        else:
+            if share_count % count:
+                raise ValueError(
+                    f"layer group {lg}: this rank holds 1 of {count} shares, which {share_count} "
+                    "shares do not divide into"
+                )
+            parts = share_count // count
+            if parts > 1:
+                g = int(layout.pool_group_of[lg])
+                widths = layout.layout.pool_groups[g]
+                for b in buffers:
+                    _check_splits(b, parts)
+                for pool, width in enumerate(widths):
+                    covered = sum(b.size for b in buffers if b.pool[1] == pool)
+                    if covered != width:
+                        raise ValueError(
+                            f"layer group {lg}: buffers cover {covered} of the {width} bytes of "
+                            f"pool {pool}'s slot, which do not split by head"
+                        )
+            out.append((share_count, int(index) * parts, parts))
+        g = int(layout.pool_group_of[lg])
+        if parts_of_pool_group.setdefault(g, parts) != parts:
+            raise ValueError(
+                f"layer groups of pool group {g} hold {parts_of_pool_group[g]} and {parts} shares"
+            )
+    return tuple(out)
+
+
+def share_layout(layout: Layout, parts: Mapping[int, int]) -> Layout:
+    """``layout`` as a rank holding one share of each pool group ``g``'s ``parts[g]`` would lay it
+    out: slot widths, buffer offsets, sizes and head counts divided by ``parts[g]``. Its
+    ``layout_id`` is the same on every rank naming its content by the same shares; ``layout`` itself
+    where every pool group holds one share."""
+    if all(int(parts.get(g, 1)) == 1 for g in layout.pool_groups):
+        return layout
+    pool_groups = {
+        g: tuple(int(w) // int(parts.get(g, 1)) for w in widths)
+        for g, widths in layout.pool_groups.items()
+    }
+    buffers = []
+    for b in layout.buffers:
+        p = int(parts.get(b.pool[0], 1))
+        if p == 1:
+            buffers.append(b)
+            continue
+        heads = b.geometry.num_heads
+        geometry = BufferGeometry(
+            b.geometry.section_bytes,
+            b.geometry.bytes_per_head,
+            None if heads is None else heads // p,
+        )
+        buffers.append(
+            BufferDesc(
+                layer=b.layer,
+                role=b.role,
+                pool=b.pool,
+                offset=b.offset // p,
+                size=b.size // p,
+                mapper=b.mapper,
+                geometry=geometry,
+                transfer=b.transfer,
+                expansion=b.expansion,
+            )
+        )
+    return Layout(
+        tokens_per_block=layout.tokens_per_block,
+        pool_groups=pool_groups,
+        layer_groups=layout.layer_groups,
+        buffers=tuple(buffers),
+    )

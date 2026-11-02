@@ -620,6 +620,7 @@ def test_the_attach_functions_keep_their_signatures():
         ("manager", kind.POSITIONAL_OR_KEYWORD, kind.empty),
         ("scope", kind.KEYWORD_ONLY, kind.empty),
         ("staging", kind.KEYWORD_ONLY, kind.empty),
+        ("share_count", kind.KEYWORD_ONLY, None),
     ]
 
 

@@ -24,6 +24,7 @@ Mooncake pool (``TRTLLM_MOONCAKE_PROTOCOL``, default rdma). Allocates device poo
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import threading
 from dataclasses import dataclass, replace
@@ -51,6 +52,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     StagingOptions,
     attach_lender,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._layout import derive_layout, group_buffers
 
 # An exception that escapes a thread fails the test.
 pytestmark = [
@@ -152,8 +154,8 @@ def stores(request, tmp_path):
             opened.close()
 
 
-def attach(mgr):
-    return attach_lender(mgr, scope=SCOPE, staging=StagingOptions(END))
+def attach(mgr, share_count=None):
+    return attach_lender(mgr, scope=SCOPE, staging=StagingOptions(END), share_count=share_count)
 
 
 def ready_view(lease, mgr, tries: int = 3):
@@ -193,10 +195,13 @@ def build(stores: Stores, lender, wake: Wake):
     return binding, backend
 
 
-def publish(stores, kit, mgr, select=None):
-    """Publishes the source request's blocks (those ``select`` keeps); returns the view lent."""
+def publish(stores, kit, mgr, select=None, *, share_count=None, rewrite=None):
+    """Publishes the source request's blocks (those ``select`` keeps), named in ``share_count``
+    shares, after ``rewrite(mgr, source)`` changed its pages; returns the view lent."""
     source = kit.published(mgr, SOURCE, PROMPT)
-    lender, wake = attach(mgr), Wake()
+    if rewrite is not None:
+        rewrite(mgr, source)
+    lender, wake = attach(mgr, share_count), Wake()
     binding, backend = build(stores, lender, wake)
     lease = lender.lend_read(source, 0, END)
     view = ready_view(lease, mgr)
@@ -211,11 +216,11 @@ def publish(stores, kit, mgr, select=None):
     return source, view
 
 
-def fetch(stores, kit, mgr):
-    """Fetches every block of the target request; returns the target, lender, lease, outcome,
-    backend and binding, the lease not yet marked."""
+def fetch(stores, kit, mgr, *, share_count=None):
+    """Fetches every block of the target request, named in ``share_count`` shares; returns the
+    target, lender, lease, outcome, backend and binding, the lease not yet marked."""
     target = kit.admitted(mgr, TARGET, PROMPT)
-    lender, wake = attach(mgr), Wake()
+    lender, wake = attach(mgr, share_count), Wake()
     binding, backend = build(stores, lender, wake)
     lease = lender.lend_write(target, 0, END)
     view = lease.poll()
@@ -264,3 +269,111 @@ def test_a_partial_fetch_resumes_only_up_to_its_first_undelivered_block(kit, rea
         assert backend.shutdown(WAIT_S) == frozenset()
         binding.release_hold()
         binding.driver.close()
+
+
+# Tensor-parallel ranks name their heads in SHARES head ranges, the lcm of the sizes below.
+HEADS = 4
+SHARES = 4
+
+
+def tp(size: int, rank: int):
+    """Rank ``rank`` of ``size`` tensor-parallel ranks."""
+    from tensorrt_llm.mapping import Mapping
+
+    return Mapping(world_size=size, tp_size=size, rank=rank)
+
+
+def head_bytes(ordinal: int, layer: int, role: str, head: int, nbytes: int) -> bytes:
+    """One KV head of one buffer of block ``ordinal``: the same bytes on every rank holding it."""
+    name = f"{ordinal}/{layer}/{role}/{head}".encode()
+    seed = int.from_bytes(hashlib.sha256(name).digest()[:8], "little")
+    return np.random.default_rng(seed).integers(0, 256, nbytes, dtype=np.uint8).tobytes()
+
+
+def rank_page(mgr, ordinal: int) -> bytes:
+    """Block ``ordinal``'s page of layer group 0 on ``mgr``'s rank: of every buffer, in pool order,
+    the heads that rank holds, head after head."""
+    layout = derive_layout(mgr)
+    assert layout.num_layer_groups == 1
+    g = layout.pool_group_of[0]
+    widths = layout.layout.pool_groups[g]
+    page = bytearray(int(layout.page_bytes[g]))
+    covered = 0
+    for b in group_buffers(layout, 0):
+        heads, nbytes = b.geometry.num_heads, b.geometry.bytes_per_head
+        first = mgr.mapping.tp_rank * heads
+        start = sum(widths[: b.pool[1]]) + b.offset
+        for j in range(heads):
+            page[start + j * nbytes : start + (j + 1) * nbytes] = head_bytes(
+                ordinal, b.layer, b.role, first + j, nbytes
+            )
+        covered += b.size
+    assert covered == len(page), "a page holds bytes no buffer covers"
+    return bytes(page)
+
+
+def write_heads(kit, mgr, request) -> None:
+    """Overwrite the request's whole blocks with the heads ``mgr``'s rank holds (``rank_page``)."""
+    dev = kit.DevicePages(mgr)
+    for ordinal, slot in enumerate(kit.pages(kit.kv(mgr, request), 0)[:BLOCKS]):
+        dev.write(0, slot, rank_page(mgr, ordinal))
+
+
+def fetch_rank(stores, kit, mgr):
+    """Fetches the target's blocks into ``mgr`` in ``SHARES`` shares and marks what arrived;
+    returns the target, the lender, the delivered rows and the pages, then lets everything go."""
+    target, lender, lease, outcome, backend, binding = fetch(stores, kit, mgr, share_count=SHARES)
+    assert outcome.fault is None
+    (rows,) = outcome.delivered_masks
+    assert len(rows) == BLOCKS * SHARES // mgr.mapping.tp_size  # a row per share held
+    lease.mark_arrived([np.array(mask) for mask in outcome.delivered_masks])
+    mgr._stream.synchronize()
+    pages = [kit.digest(kit.page(mgr, target, 0, ordinal)) for ordinal in range(BLOCKS)]
+    bounds = lender.resume_bounds(target)
+    lease.release()
+    assert backend.shutdown(WAIT_S) == frozenset()
+    binding.release_hold()
+    binding.driver.close()
+    return bounds, rows.tolist(), pages
+
+
+@pytest.mark.parametrize("write_tp,read_tp", [(4, 2), (2, 4), (4, 1), (1, 4), (2, 2)])
+def test_heads_published_at_one_tensor_parallel_size_are_fetched_at_another(
+    kit, real_manager, stores, write_tp, read_tp
+) -> None:
+    """Every rank of one size publishes its heads named in SHARES head ranges; every rank of
+    another fetches the ranges it holds and gets exactly its own heads of every block."""
+    with contextlib.ExitStack() as stack:
+        for rank in range(write_tp):
+            mgr = stack.enter_context(real_manager(num_kv_heads=HEADS, mapping=tp(write_tp, rank)))
+            publish(
+                stores, kit, mgr, share_count=SHARES, rewrite=lambda m, r: write_heads(kit, m, r)
+            )
+        for rank in range(read_tp):
+            mgr = stack.enter_context(real_manager(num_kv_heads=HEADS, mapping=tp(read_tp, rank)))
+            bounds, rows, pages = fetch_rank(stores, kit, mgr)
+            assert all(rows), f"read rank {rank} missed rows {rows}"
+            assert bounds == ResumeBounds(END, 0)
+            expected = [kit.digest(rank_page(mgr, ordinal)) for ordinal in range(BLOCKS)]
+            assert pages == expected, f"read rank {rank} of {read_tp} got other heads"
+
+
+def test_a_block_arrives_only_once_every_share_of_it_did(kit, real_manager, stores) -> None:
+    """Rank 3 of four never publishes: the TP2 rank holding its heads gets the other range's rows
+    but no block, the other TP2 rank every block."""
+    with contextlib.ExitStack() as stack:
+        for rank in range(3):
+            mgr = stack.enter_context(real_manager(num_kv_heads=HEADS, mapping=tp(4, rank)))
+            publish(
+                stores, kit, mgr, share_count=SHARES, rewrite=lambda m, r: write_heads(kit, m, r)
+            )
+        whole = stack.enter_context(real_manager(num_kv_heads=HEADS, mapping=tp(2, 0)))
+        bounds, rows, pages = fetch_rank(stores, kit, whole)
+        assert all(rows) and bounds == ResumeBounds(END, 0)
+        assert pages == [kit.digest(rank_page(whole, ordinal)) for ordinal in range(BLOCKS)]
+        torn = stack.enter_context(real_manager(num_kv_heads=HEADS, mapping=tp(2, 1)))
+        bounds, rows, pages = fetch_rank(stores, kit, torn)
+        assert rows == [True, False] * BLOCKS  # shares 2 and 3 of each block, block by block
+        assert bounds.max_position == 0
+        sentinel = kit.digest(bytes([kit.SENTINEL]) * kit.DevicePages(torn).page_bytes(0))
+        assert pages == [sentinel] * BLOCKS

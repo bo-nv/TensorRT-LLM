@@ -53,7 +53,9 @@ def namespace(scope: bytes, layout_id: bytes) -> bytes:
 
 class Identity:
     """Object keys and region labels for one manager. ``layers[g]`` holds layer group ``g``'s global
-    layer ids and ``shards[g]`` the ``(count, index)`` share of its content this rank holds."""
+    layer ids and ``shards[g]`` the shares of its content this rank holds: ``(count, index)``, one
+    share of ``count``, or ``(count, first, parts)``, the ``parts`` consecutive shares of ``count``
+    from ``first``, each named on its own."""
 
     namespace: bytes
     layout_id: bytes
@@ -64,7 +66,7 @@ class Identity:
         scope: bytes,
         layout_id: bytes,
         layers: Sequence[Sequence[int]],
-        shards: Sequence[tuple[int, int]],
+        shards: Sequence[tuple[int, ...]],
     ) -> None:
         if len(shards) != len(layers):
             raise ValueError(f"{len(layers)} layer groups but {len(shards)} shards")
@@ -73,21 +75,35 @@ class Identity:
         self.canonical = canonical_order(layers)
         self._namespace = np.frombuffer(self.namespace, dtype=np.uint8)
         self._groups = []
-        for index, (count, share) in zip(self.canonical, shards):
-            ShardDesc(count, share)  # ValueError for a share outside the count
-            suffix = _u16(index) + _u16(count) + _u16(share)
-            self._groups.append(np.frombuffer(suffix, dtype=np.uint8))
+        for index, shard in zip(self.canonical, shards):
+            count, first, parts = (*shard, 1) if len(shard) == 2 else shard
+            if parts < 1:
+                raise ValueError(f"a rank holds at least one share, got {parts}")
+            ShardDesc(count, first + parts - 1)  # ValueError for a share outside the count
+            suffixes = b"".join(
+                _u16(index) + _u16(count) + _u16(share) for share in range(first, first + parts)
+            )
+            self._groups.append(np.frombuffer(suffixes, dtype=np.uint8).reshape(parts, -1))
+
+    def parts(self, layer_group_index: int) -> int:
+        """The shares of layer group ``layer_group_index`` this rank holds, each one object."""
+        return int(self._groups[layer_group_index].shape[0])
 
     def object_keys(self, layer_group_index: int, reuse_keys: np.ndarray) -> np.ndarray:
-        """``uint8 (n, OBJECT_KEY_BYTES)``: the namespace, each entry's 32-byte reuse key, then
-        the group's canonical index, shard count and shard index as big-endian ``u16``."""
+        """``uint8 (n * parts, OBJECT_KEY_BYTES)``, block-major: for each entry's 32-byte reuse key,
+        one key per share this rank holds, each the namespace, the reuse key, then the group's
+        canonical index, share count and share index as big-endian ``u16``."""
         if not 0 <= layer_group_index < len(self._groups):
             raise ValueError(f"unknown layer group {layer_group_index}")
+        suffixes = self._groups[layer_group_index]
         reuse_keys = np.ascontiguousarray(reuse_keys, dtype=np.uint8).reshape(-1, REUSE_KEY_BYTES)
-        out = np.empty((reuse_keys.shape[0], OBJECT_KEY_BYTES), dtype=np.uint8)
+        rows = reuse_keys.shape[0] * suffixes.shape[0]
+        out = np.empty((rows, OBJECT_KEY_BYTES), dtype=np.uint8)
         out[:, :_NAMESPACE_BYTES] = self._namespace
-        out[:, _NAMESPACE_BYTES : _NAMESPACE_BYTES + REUSE_KEY_BYTES] = reuse_keys
-        out[:, _NAMESPACE_BYTES + REUSE_KEY_BYTES :] = self._groups[layer_group_index]
+        out[:, _NAMESPACE_BYTES : _NAMESPACE_BYTES + REUSE_KEY_BYTES] = np.repeat(
+            reuse_keys, suffixes.shape[0], axis=0
+        )
+        out[:, _NAMESPACE_BYTES + REUSE_KEY_BYTES :] = np.tile(suffixes, (reuse_keys.shape[0], 1))
         return out
 
     def region_label(self, layer_group_indices: Iterable[int]) -> str:
