@@ -48,6 +48,7 @@ from .page_layout import (
 from .page_layout import ByHead as ByHead
 from .page_layout import Own as Own
 from .page_layout import Replicated as Replicated
+from .page_layout import RingSlots as RingSlots
 from .page_layout import RoleLayout as RoleLayout
 from .page_layout import Sectioned as Sectioned
 

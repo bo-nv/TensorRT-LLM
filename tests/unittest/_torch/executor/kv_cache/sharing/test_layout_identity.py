@@ -48,6 +48,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     Piece,
     RankTopology,
     Replicated,
+    RingSlots,
     RoleLayout,
     Sectioned,
     ShardDesc,
@@ -184,6 +185,7 @@ def test_layout_id_leaves_out_what_does_not_decide_how_bytes_read(variant):
         lambda: _replace_buffers(make_layout(), layout=ByHead(head_bytes=5, total=8)),
         lambda: _replace_buffers(make_layout(), layout=ByHead(True, 10, 4, 2)),
         lambda: _replace_buffers(make_layout(), layout=Sectioned((15, 5))),
+        lambda: _replace_buffers(make_layout(), layout=RingSlots(4)),
         lambda: _replace_buffers(make_layout(), transferred=False),
         lambda: _replace_buffers(make_layout(), expansion=2),
         lambda: _replace_buffers(make_layout(), role="scale2"),
@@ -205,6 +207,7 @@ def test_layout_id_leaves_out_what_does_not_decide_how_bytes_read(variant):
         "head_size",
         "token_major",
         "sections",
+        "ring",
         "transfer",
         "expansion",
         "role",
@@ -303,13 +306,13 @@ def test_layout_id_hashes_every_layout_field_but_the_element_type():
     buffers = (
         dataclasses.replace(key, layout=ByHead(head_bytes=10, total=10, dtype="bfloat16")),
         dataclasses.replace(scale, layout=Sectioned((15, 5), split=("tp", "cp"))),
-        other,
+        dataclasses.replace(other, layout=RingSlots(8, dtype="bfloat16")),
     )
     document = layout_document(dataclasses.replace(layout, buffers=buffers))
-    assert [b.get("layout") for b in document["buffers"]] == [
+    assert [b["layout"] for b in document["buffers"]] == [
         {"layout": "by_head", "head_bytes": 10, "total": 10},
         {"layout": "sectioned", "section_bytes": [15, 5], "split": ["tp", "cp"]},
-        None,
+        {"layout": "ring", "slots": 8},
     ]
     stretched = dataclasses.replace(other, layout=_Stretched(factor=3))
     novel = layout_document(dataclasses.replace(layout, buffers=(key, scale, stretched)))
@@ -377,7 +380,7 @@ def test_a_layout_says_how_its_split_holds():
         ByHead(head_bytes=0)
     with pytest.raises(ValueError, match="one or more sections"):
         Sectioned(())
-    assert Replicated().split == () and Own().split == ("tp",)
+    assert Replicated().split == () and RingSlots(4).split == () and Own().split == ("tp",)
 
 
 @pytest.mark.cpu_only
@@ -2829,6 +2832,7 @@ LAYOUT_KINDS = {
     Own: "split=('tp',)",
     Sectioned: "section_bytes split=('tp',) dtype=None",
     ByHead: "token_major=False head_bytes=None total=None tokens=None split=('tp',) dtype=None",
+    RingSlots: "slots dtype=None",
     Paged: "",
     PerRequest: "",
 }
@@ -2890,6 +2894,7 @@ def test_the_layout_types_keep_their_module_fields_and_members():
         "own",
         "sectioned",
         "by_head",
+        "ring",
         "attention",
         "state",
     ]
@@ -3114,6 +3119,7 @@ def every_field_set():
         buffers=(
             BufferDesc(0, "key", 0, 0, 0, 64, ByHead(True, 32, 8, 4, dtype="float8_e4m3fn")),
             BufferDesc(2, "scale", 0, 1, 8, 8, transferred=False),
+            BufferDesc(2, "tail", 0, 0, 64, 32, RingSlots(4, dtype="bfloat16")),
             BufferDesc(1, "conv", 1, 0, 0, 48, Sectioned((16, 32)), expansion=2),
             BufferDesc(1, "rows", 1, 0, 0, 48, Own(("tp", "cp"))),
         ),

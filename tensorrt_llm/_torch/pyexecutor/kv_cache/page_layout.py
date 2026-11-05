@@ -22,6 +22,7 @@ pieces (``RoleLayout.pieces``):
     ByHead(head_bytes=256, total=8)  # 8 heads of 256 B; TP2 rank 1 holds heads 4..7, bytes 1024..
     Sectioned((32, 16, 16))          # [x | B | C], each section split by byte over the ranks
     Replicated()                     # the whole buffer alike on every rank
+    RingSlots(19)                    # token position p in slot p % 19, alike on every rank
 
 How two ranks' pages correspond is derived from the pieces alone (``layout_mapping``), so a new way
 of laying a role out is one ``RoleLayout`` subclass saying which pieces a rank holds; a layer
@@ -53,6 +54,7 @@ __all__ = [
     "Piece",
     "RankTopology",
     "Replicated",
+    "RingSlots",
     "RoleLayout",
     "Sectioned",
     "ShardDesc",
@@ -171,8 +173,8 @@ class RoleLayout:
 
     A subclass is one way of laying a role out, a frozen dataclass whose fields are its data,
     named (``name``) for peers and for ``layout_id``. A new way is one subclass, here or in a
-    model's own module, giving ``pieces`` and ``space``; one of token positions (``positional``)
-    also gives ``positions``, ``index_of`` and ``stride``. A manager's spec
+    model's own module, giving ``pieces`` and ``space``; one of token positions (``positional``),
+    as ``RingSlots``, also gives ``positions``, ``index_of`` and ``stride``. A manager's spec
     (``page_table.PageTableSpec``) names a layout per role; each buffer's is that layout resolved
     from the buffer's facts (``resolve``).
 
@@ -499,6 +501,54 @@ class ByHead(RoleLayout):
 
     def even(self, ranks: int) -> bool:
         return self.total % ranks == 0 or ranks % self.total == 0
+
+
+@dataclass(frozen=True)
+class RingSlots(RoleLayout):
+    """A ring of ``slots`` token positions alike on every rank: of its page's tokens, position
+    ``p`` lies in slot ``p % slots``, so the buffer keeps the latest ``slots`` positions the page
+    has written. Each side sizes it as it keeps, so peers may differ in its slots.
+
+    FP4 MLA's high-precision tail on a generation worker, 19 slots in pages of 32 tokens: of page
+    1 (positions 32..63) written up to position 50, it holds 32..49, position 40 in slot 2.
+
+    Attributes:
+        slots: Positive number of positions the ring keeps on this rank.
+        dtype: The type of the elements by name, or None.
+
+    Raises:
+        ValueError: If slots is not a positive integer.
+    """
+
+    name: ClassVar[str] = "ring"
+    positional: ClassVar[bool] = True
+    slots: int
+    dtype: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "slots", _integer(self.slots, "ring slots", 1))
+        _dtype(self)
+
+    def check(self, size: int) -> None:
+        if size % self.slots:
+            raise ValueError(f"{size} bytes is not a whole number of {self.slots} slots")
+
+    def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
+        return (Piece(0, 0, size // self.slots),)
+
+    def space(self, size: int, ranks: int) -> tuple:
+        return ("ring", size // self.slots)
+
+    def positions(self, page: int, end: int, tokens_per_page: int) -> range:
+        first = page * tokens_per_page
+        written = min(end, first + tokens_per_page)
+        return range(max(first, written - self.slots), written)
+
+    def index_of(self, positions, tokens_per_page: int):
+        return positions % self.slots
+
+    def stride(self, size: int) -> int:
+        return size // self.slots
 
 
 def check_pieces(layout: RoleLayout, size: int, ranks: int, rank: int) -> None:

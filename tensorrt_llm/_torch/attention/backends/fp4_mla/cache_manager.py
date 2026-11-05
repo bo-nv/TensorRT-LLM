@@ -11,7 +11,7 @@ import torch
 
 from tensorrt_llm._torch.kimi_k3_cache_policy import get_kimi_k3_bf16_kv_layer_ids
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ByHead, PageTableSpec, Replicated
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ByHead, PageTableSpec, RingSlots
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.logger import logger
@@ -937,10 +937,11 @@ class Fp4MlaV2CacheLayoutPolicy:
 
     def page_table_spec(self) -> PageTableSpec:
         """Latents token-major by head, as the FP4 MLA kernels write them; the high-precision tail
-        alike on every rank. V scales and packed V derive from K and K scales; the generation
-        worker rebuilds them locally in rebuild_disagg_imported_cache. A model layer's cache and
-        its high-precision tail are two internal layers: global layers ``2 * m`` and
-        ``2 * m + 1``, both of model layer ``m``."""
+        a ring of BF16 latent tokens alike on every rank, sized by this worker's speculative
+        rewind, so a context and a generation worker may size it differently. V scales and packed
+        V derive from K and K scales; the generation worker rebuilds them locally in
+        rebuild_disagg_imported_cache. A model layer's cache and its high-precision tail are two
+        internal layers: global layers ``2 * m`` and ``2 * m + 1``, both of model layer ``m``."""
         spec = KVCacheManagerV2.page_table_spec(self)
         layer_ids = {}
         for layer_group_id, layers in enumerate(self.impl.layer_grouping):
@@ -951,7 +952,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         return replace(
             spec,
             role_layouts={
-                Role.MLA_HP_TAIL: Replicated(),
+                Role.MLA_HP_TAIL: RingSlots(self._fp4_mla_hp_pool_size, dtype="bfloat16"),
             },
             default_layout=ByHead(token_major=True),
             derived_roles=spec.derived_roles | {Role.MLA_V_SCALE, Role.MLA_V_PACKED},
