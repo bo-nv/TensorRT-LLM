@@ -22,6 +22,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.cache_manager import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import layer_ids_of
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, QSASparseAttentionConfig
@@ -271,12 +272,14 @@ def test_transfer_views_do_not_depend_on_the_kv_head_split(dtype: DataType) -> N
             views["position"] = cm.get_qsa_position_buffer()
             logical = {key: _logical_page(view) for key, view in views.items()}
             # How each side buffer spreads over ranks, as the page table declares it.
+            global_of = {lid: ids[0] for lid, ids in layer_ids_of(cm).items()}
+            described = {
+                (b.layer, b.role): b.tensors for b in cm.get_page_table().page_layout.buffers
+            }
             tensors = {
-                (layer, role): cm._page_buffer_tensors(
-                    cm.layer_offsets[layer], role, size, _TPB, False
-                )
+                (layer, role): described[(global_of[cm.layer_offsets[layer]], role)]
                 for layer, layer_roles in roles.items()
-                for role, size in layer_roles
+                for role, _ in layer_roles
             }
             seen[name] = (roles, logical, tensors)
         finally:

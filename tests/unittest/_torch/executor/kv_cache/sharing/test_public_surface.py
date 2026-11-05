@@ -79,15 +79,8 @@ INTERNALS = {
     "layer_grouping",
     "pool_group_descs",
     "_has_lossy_cold_page_codec",
-    # The hooks a manager builds its page table with; the lender reads the table it returns.
-    "_page_buffer_tensors",
-    "_page_head_split",
-    "_page_state_split",
-    "_page_group_kind",
-    "_page_untransferred_roles",
-    "_page_derived_roles",
-    "_page_layer_ids",
-    "_page_kv_heads",
+    # What a manager builds its page table from; the lender reads the table it returns.
+    "page_table_spec",
     "get_life_cycle_pool_group_indices",
     "_reuse_token_source",
     "_augment_tokens_for_block_reuse",

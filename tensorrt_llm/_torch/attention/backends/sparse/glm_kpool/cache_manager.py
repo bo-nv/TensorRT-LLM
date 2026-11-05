@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 
 import torch
 
@@ -27,7 +28,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, replicated
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -96,13 +97,10 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             if layer_id in self.layer_offsets
         }
 
-    def _page_buffer_tensors(
-        self, layer_id: int, role: str, size: int, tokens: int, state: bool
-    ) -> tuple[Tensor, ...]:
+    def page_table_spec(self) -> PageTableSpec:
         """The indexer rows are as wide on every tensor rank and hold the same bytes."""
-        if role == Role.INDEX_KEY:
-            return replicated(size)
-        return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
+        spec = super().page_table_spec()
+        return replace(spec, role_layouts={**spec.role_layouts, Role.INDEX_KEY: Replicated()})
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: DataRole) -> int:
         index_bytes = (

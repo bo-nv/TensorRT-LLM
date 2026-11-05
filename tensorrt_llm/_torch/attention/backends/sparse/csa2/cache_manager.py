@@ -23,7 +23,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _estimate_swa_cache_size,
     _fill_kv_pages,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, replicated
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import (
+    PageTableSpec,
+    Replicated,
+    layer_ids_of,
+)
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -1096,11 +1100,19 @@ class CSA2CacheManager(KVCacheManagerV2):
             for size, window in zip(sizes, windows)
         )
 
-    def _page_buffer_tensors(
-        self, layer_id: int, role: str, size: int, tokens: int, state: bool
-    ) -> tuple[Tensor, ...]:
-        """Every CSA2 cache holds the same bytes on every rank."""
-        return replicated(size)
+    def page_table_spec(self) -> PageTableSpec:
+        """Every CSA2 cache holds the same bytes on every rank. Under bounded replay on generation
+        the generation worker rebuilds the sliding-window caches past a request's split, which a
+        context-only worker keeps none of (``disagg_untransferred_buffers``)."""
+        spec = super().page_table_spec()
+        replay = getattr(self, "bounded_replay_on_generation", False)
+        rebuilt = {CSA2CacheRole.SWA.role} if replay else set()
+        return replace(
+            spec,
+            role_layouts={},
+            default_layout=Replicated(),
+            request_rebuilt_roles=spec.request_rebuilt_roles | rebuilt,
+        )
 
     def disagg_transfer_length(self, request) -> int:
         """Under remote-tail replay the generation worker recomputes the prompt from the remote
@@ -1108,20 +1120,13 @@ class CSA2CacheManager(KVCacheManagerV2):
         start = getattr(request, "py_csa2_remote_tail_start", None)
         return request.prompt_len if start is None else start
 
-    def _page_request_rebuilt_roles(self) -> frozenset[str]:
-        """Under bounded replay on generation the generation worker rebuilds the sliding-window
-        caches past a request's split, which a context-only worker keeps none of."""
-        if getattr(self, "bounded_replay_on_generation", False):
-            return frozenset({str(CSA2CacheRole.SWA.role)})
-        return frozenset()
-
     def disagg_untransferred_buffers(self, request) -> frozenset[tuple[int, str]]:
         """Under remote-tail replay the generation worker rebuilds the sliding-window caches of the
         decoder and draft layers (model layers from the split on), so the transfer leaves them."""
         split = getattr(request, "py_csa2_remote_tail_split", None)
         if split is None:
             return frozenset()
-        global_of = {lid: ids[0] for lid, ids in self._page_layer_ids().items()}
+        global_of = {lid: ids[0] for lid, ids in layer_ids_of(self).items()}
         return frozenset(
             (global_of[int(layer_id)], str(role))
             for (layer_id, role), (model_layer, _ratio, cache_role) in self._physical_roles.items()

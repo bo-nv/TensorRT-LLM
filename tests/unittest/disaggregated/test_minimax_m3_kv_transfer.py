@@ -38,6 +38,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3KV
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import head_major, replicated, token_major
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import BufferSite
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -85,22 +86,32 @@ def test_minimax_cache_indices_support_block_count_limit() -> None:
     ]
 
 
-def _with_two_of_four_heads(manager: KVCacheManagerV2) -> KVCacheManagerV2:
-    """The manager as rank 0 of TP2 holding 2 of a layer's 4 KV heads."""
-    manager.mapping = SimpleNamespace(tp_size=2, tp_rank=0)
-    manager._page_kv_heads = lambda layer: (2, 4)
-    return manager
+def _laid_out(manager: KVCacheManagerV2, role: str, size: int):
+    """The tensors the manager's page table spec lays out for a ``size``-byte ``role`` buffer.
+
+    The buffer is of an attention layer of 4 KV heads, on rank 0 of TP2, which holds 2 of them.
+    """
+    site = BufferSite(
+        layer=0,
+        role=role,
+        size=size,
+        tokens=16,
+        state=False,
+        kv_heads=(2, 4),
+        split=("tp",),
+        ranks=2,
+    )
+    return manager.page_table_spec().layout_of(role).tensors(site)
 
 
 @pytest.mark.cpu_only
-def test_v2_page_buffer_tensor_defaults() -> None:
-    manager = _with_two_of_four_heads(object.__new__(KVCacheManagerV2))
+def test_v2_page_table_spec_defaults() -> None:
+    manager = object.__new__(KVCacheManagerV2)
 
-    # K/V split by head, head-major; the index-key side cache spreads as its manager declares it
-    # (MiniMax M3 below), so the base declares none.
-    assert manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == head_major(256, 2, 4)
-    with pytest.raises(ValueError, match="does not declare how its bytes spread"):
-        manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False)
+    # K/V split by head, head-major; the index-key side cache spreads as its manager lays it out
+    # (MiniMax M3 below), so the base lays out none.
+    assert _laid_out(manager, Role.KEY, 256) == head_major(256, 2, 4)
+    assert manager.page_table_spec().layout_of(Role.INDEX_KEY) is None
 
 
 @pytest.mark.cpu_only
@@ -112,7 +123,7 @@ def test_v2_page_buffer_tensor_defaults() -> None:
         ("triton", DataType.NVFP4, "NHD"),
     ],
 )
-def test_minimax_page_buffer_tensors(
+def test_minimax_page_table_spec(
     monkeypatch: pytest.MonkeyPatch,
     implementation: str,
     cache_dtype: DataType,
@@ -138,12 +149,11 @@ def test_minimax_page_buffer_tensors(
     )
 
     assert manager._main_kv_layout_name() == expected_main_layout
-    _with_two_of_four_heads(manager)
     expected_kv = (
         token_major(256, 16, 2, 4) if expected_main_layout == "NHD" else head_major(256, 2, 4)
     )
-    assert manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == expected_kv
-    assert manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False) == replicated(128)
+    assert _laid_out(manager, Role.KEY, 256) == expected_kv
+    assert _laid_out(manager, Role.INDEX_KEY, 128) == replicated(128)
     if implementation == "triton":
         fp8_manager = MiniMaxM3KVCacheManagerV2(
             num_layers=0,
@@ -154,10 +164,7 @@ def test_minimax_page_buffer_tensors(
                 implementation="triton", indexer_kv_dtype="bf16"
             ),
         )
-        _with_two_of_four_heads(fp8_manager)
-        assert fp8_manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == token_major(
-            256, 16, 2, 4
-        )
+        assert _laid_out(fp8_manager, Role.KEY, 256) == token_major(256, 16, 2, 4)
         assert fp8_manager._dense_native_layer_ids == ()
 
 

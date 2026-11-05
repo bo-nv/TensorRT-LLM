@@ -134,32 +134,14 @@ from ..resource_manager import (
 )
 from ..scheduler import ScheduledRequests
 from . import _lender_hooks
-from .page_layout import (
-    BufferDesc,
-    GroupKind,
-    LayerGroupDesc,
-    Paged,
-    PageLayout,
-    PerRequest,
-    Tensor,
-    content_shard,
-    grid_place,
-    head_major,
-    held_bytes,
-    owned,
-    token_major,
-)
 from .page_table import (
-    DevicePool,
+    ByHead,
     ManagerLayout,
-    buffer_expansions,
-    has_sparse_buffers,
-    is_non_required_layer,
-    is_private_layer,
+    PageTableSpec,
+    build_page_table,
     is_recurrent_layer,
+    kv_dtype_name,
     layer_configs_by_id,
-    rank_topology,
-    virtual_layers,
 )
 
 if TYPE_CHECKING:
@@ -304,7 +286,7 @@ class Role:
     ALL = DataRole("all")
 
 
-# The roles the base manager splits by KV head (_page_buffer_tensors).
+# The roles the base manager splits by KV head (page_table_spec).
 _HEAD_SPLIT_ROLES = frozenset(
     str(role) for role in (Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
 )
@@ -3355,7 +3337,7 @@ class KVCacheManagerV2(BaseResourceManager):
             raise ValueError("Mixed precision requires FP16/BF16/FP8 high KV")
         layers = list(config.layers)
         # Disaggregated transfer and the lender name layers from this (model
-        # layer, kind) mapping (_virtual_layers). Every pipeline stage keeps it,
+        # layer, kind) mapping (page_table.virtual_layers). Every pipeline stage keeps it,
         # twins or not, so a model layer has one name under any split.
         layer_attn_to_layer_id = {
             (model, _MixedPrecisionLayerKind.PRIMARY): LayerId(local)
@@ -3493,455 +3475,27 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_page_table(self) -> ManagerLayout:
         """This manager's page table: its page layout, device pools and the facts of its layer
-        groups, which whoever lends or moves its pages reads instead of the manager.
+        groups, which whoever lends or moves its pages reads instead of the manager
+        (``page_table.build_page_table``, from the runtime config and storage and
+        ``page_table_spec``). ``ValueError`` if its layer groups, layer configs and spec do not
+        agree."""
+        return build_page_table(self)
 
-        Built from the runtime config and storage and the hooks below: how each buffer's bytes
-        spread over ranks (``_page_buffer_tensors``), how layers are named (``_page_layer_ids``),
-        the KV heads (``_page_kv_heads``), which roles never travel because they hold nothing a
-        peer needs (``_page_untransferred_roles``) or the receiver rebuilds them
-        (``_page_derived_roles``), which it rebuilds per request instead of receiving them
-        (``_page_request_rebuilt_roles``, with ``disagg_untransferred_buffers``) and the
-        quantization (``_page_quant_mode``); a subclass overrides the hook whose answer differs.
-        ``ValueError`` if its layer groups, layer configs and declarations do not agree."""
-        tokens_per_block = int(self.tokens_per_block)
-        layer_cfg = self._page_layer_configs()
-        grouping = [[int(layer) for layer in group] for group in self.impl.layer_grouping]
-        pg_of_lg = [int(g) for g in self.impl.get_life_cycle_pool_group_indices()]
-        if len(pg_of_lg) != len(grouping):
-            raise ValueError(f"{len(grouping)} layer groups but {len(pg_of_lg)} pool-group indices")
-        layer_ids = self._page_layer_ids()
-        missing = sorted({lid for group in grouping for lid in group} - set(layer_ids))
-        if missing:
-            raise ValueError(f"the manager names no global layer for internal layers {missing}")
-        global_of = {lid: int(ids[0]) for lid, ids in layer_ids.items()}
-        model_of = {lid: int(ids[1]) for lid, ids in layer_ids.items()}
-        stage_layers = {int(layer) for layer in self.pp_layers}
-        unheld = sorted({model_of[lid] for group in grouping for lid in group} - stage_layers)
-        if unheld:
-            raise ValueError(
-                f"the manager names model layers {unheld}, which this pipeline stage does not "
-                f"hold (pp_layers {sorted(stage_layers)})"
-            )
-        kv_heads = {lid: self._page_kv_heads(lid) for group in grouping for lid in group}
+    def page_table_spec(self) -> PageTableSpec:
+        """What this manager says of its pages that its runtime config and storage do not: how
+        each role's bytes spread over ranks, which roles never move, are derived or are rebuilt
+        per request, how its layers are named and how its KV data is quantized.
 
-        state_groups = set()
-        for lg, group in enumerate(grouping):
-            if not group or group[0] not in layer_cfg:
-                raise ValueError(f"layer group {lg} has no layer config (layers {group})")
-            if is_recurrent_layer(layer_cfg[group[0]]):
-                state_groups.add(lg)
-
-        derived = self._page_derived_roles()
-        untransferred = self._page_untransferred_roles() | derived
-        expansions = {
-            lid: buffer_expansions(cfg, tokens_per_block) for lid, cfg in layer_cfg.items()
-        }
-
-        mapping = self.mapping
-        topology = rank_topology(mapping)
-        cp_rank, cp_size = int(self._helix_cp_rank), int(self._helix_cp_size)
-
-        device_pools: dict[int, tuple[DevicePool, ...]] = {}
-        buffers: list[BufferDesc] = []
-        # (global layer, role) -> the internal layer whose buffer it names.
-        named: dict[tuple[int, str], int] = {}
-        group_buffers: dict[int, list[BufferDesc]] = {lg: [] for lg in range(len(grouping))}
-        for pg in self.impl.pool_group_descs:
-            g = int(pg.pool_group_index)
-            pools = tuple(
-                DevicePool(
-                    g, int(p.pool_index), int(p.base_address), int(p.slot_bytes), int(pg.num_slots)
-                )
-                for p in pg.pools
-            )
-            device_pools[g] = tuple(sorted(pools, key=lambda p: p.index))
-            # One variant per layer group drawing from this pool group; pool ``i`` of a slot holds
-            # the ``i``-th coalesced buffer, whose members sit back to back.
-            for variant in pg.slot_desc.variants:
-                lg = int(variant.layer_group_id)
-                state = lg in state_groups
-                for pool_index, coalesced in enumerate(variant.coalesced_buffers):
-                    size = int(coalesced.single_buffer_size)
-                    for j, buffer_id in enumerate(coalesced.buffer_ids):
-                        lid = int(buffer_id.layer_id)
-                        role = str(buffer_id.role)
-                        transfer = role not in untransferred
-                        expansion = expansions.get(lid, {}).get(role, 1)
-                        try:
-                            tensors = self._page_buffer_tensors(
-                                lid, role, size, tokens_per_block // expansion, state
-                            )
-                            declared = sum(held_bytes(t, topology) for t in tensors)
-                        except ValueError as error:
-                            raise ValueError(f"buffer ({lid}, {role}): {error}") from error
-                        if declared != size:
-                            # Bytes no tensor describes would never move, or be moved twice.
-                            raise ValueError(
-                                f"buffer ({lid}, {role}): its tensors hold {declared} bytes on "
-                                f"this rank, not the {size} bytes of its slot"
-                            )
-                        if (
-                            expansion != 1
-                            and transfer
-                            and role not in derived
-                            and any(t.split and t.name != "own" for t in tensors)
-                        ):
-                            # Its tensors describe one page; ranks holding parts of several
-                            # sub-pages would pair bytes of different sub-pages. A rank's own
-                            # share pairs only with the same rank's, whole.
-                            raise ValueError(
-                                f"buffer ({lid}, {role}): {expansion} sub-pages per block that "
-                                "move are declarable only replicated or as each rank's own share"
-                            )
-                        owner = named.setdefault((global_of.get(lid, lid), role), lid)
-                        if owner != lid:
-                            raise ValueError(
-                                f"internal layers {owner} and {lid} both name the {role} buffer "
-                                f"of global layer {global_of.get(lid, lid)}"
-                            )
-                        desc = BufferDesc(
-                            layer=global_of.get(lid, lid),
-                            role=role,
-                            pool_group=g,
-                            pool_index=pool_index,
-                            slot_offset=j * size,
-                            size=size,
-                            tensors=tensors,
-                            transferred=transfer,
-                            expansion=expansion,
-                        )
-                        buffers.append(desc)
-                        group_buffers[lg].append(desc)
-
-        rebuilt = sorted({b.role for b in buffers if b.role in derived})
-        if rebuilt:
-            # Where each hook comes from: the manager itself for one bound to it, else the first
-            # class of its MRO defining it.
-            roles_owner, rebuild_owner = (
-                next((c for c in (self, *type(self).__mro__) if name in vars(c)), None)
-                for name in ("_page_derived_roles", "rebuild_disagg_imported_cache")
-            )
-            rebuild = (
-                vars(rebuild_owner)["rebuild_disagg_imported_cache"] if rebuild_owner else None
-            )
-            if (
-                getattr(rebuild, "__func__", rebuild)
-                is KVCacheManagerV2.rebuild_disagg_imported_cache
-            ):
-                raise ValueError(
-                    f"{type(self).__name__} derives its {rebuilt} buffers from the transferred "
-                    "ones but does not override rebuild_disagg_imported_cache, so an import would "
-                    "leave them stale"
-                )
-            if (
-                isinstance(roles_owner, type)
-                and isinstance(rebuild_owner, type)
-                and roles_owner is not rebuild_owner
-                and issubclass(roles_owner, rebuild_owner)
-            ):
-                added = sorted(set(rebuilt) - set(super(roles_owner, self)._page_derived_roles()))
-                if added:
-                    raise ValueError(
-                        f"{roles_owner.__name__} derives its {added} buffers, but its rebuild comes from "
-                        f"{rebuild_owner.__name__}, which does not know them; override "
-                        "rebuild_disagg_imported_cache with them"
-                    )
-        per_request = sorted(self._page_request_rebuilt_roles())
-        if per_request:
-            exclude_owner = next(
-                (
-                    c
-                    for c in (self, *type(self).__mro__)
-                    if "disagg_untransferred_buffers" in vars(c)
-                ),
-                None,
-            )
-            exclude = (
-                vars(exclude_owner)["disagg_untransferred_buffers"]
-                if exclude_owner is not None
-                else None
-            )
-            if (
-                exclude is None
-                or getattr(exclude, "__func__", exclude)
-                is KVCacheManagerV2.disagg_untransferred_buffers
-            ):
-                raise ValueError(
-                    f"{type(self).__name__} rebuilds its {per_request} buffers per request but "
-                    "does not override disagg_untransferred_buffers, which names the requests it "
-                    "rebuilds them for, so a peer lacking them would leave them unwritten"
-                )
-
-        layer_groups: list[LayerGroupDesc] = []
-        total_kv_heads: dict[int, int] = {}
-        for lg, group in enumerate(grouping):
-            first = layer_cfg[group[0]]
-            is_state = lg in state_groups
-            window = read = None
-            sink_tokens = 0
-            if not is_state:
-                window = getattr(first, "window_size", None)
-                window = None if window is None else int(window)
-                read = self._attention_read_window(lg)
-                read = None if read is None else int(read)
-                if (read is None) != (window is None) or (
-                    read is not None and not 0 < read <= window
-                ):
-                    raise ValueError(
-                        f"layer group {lg} reads a window of {read} tokens, which its kept window "
-                        f"of {window} tokens does not hold"
-                    )
-                sink_tokens = int(getattr(first, "num_sink_tokens", None) or 0)
-                for lid in group:
-                    total = kv_heads[lid][1]
-                    if total:
-                        total_kv_heads[global_of[lid]] = total
-            # Layer groups with equal slot sizes may share a pool group, each drawing its own
-            # slots.
-            g = pg_of_lg[lg]
-            if g not in device_pools:
-                raise ValueError(f"layer group {lg} maps to pool group {g}, which has no pools")
-            named = sorted((global_of[lid], model_of[lid]) for lid in group)
-            layer_groups.append(
-                LayerGroupDesc(
-                    kind=self._page_group_kind(lg, is_state),
-                    kept_window=window,
-                    num_sink_blocks=-(-sink_tokens // tokens_per_block),
-                    pool_group=g,
-                    layers=tuple(layer for layer, _ in named),
-                    # The lender lends derived buffers too, so its names cover their bytes.
-                    shard=content_shard(
-                        [
-                            replace(b, transferred=True) if b.role in derived else b
-                            for b in group_buffers[lg]
-                        ],
-                        topology,
-                    ),
-                    read_window=read,
-                    model_layers=tuple(model_layer for _, model_layer in named),
-                )
-            )
-
-        page_layout = PageLayout(
-            tokens_per_page=tokens_per_block,
-            pool_slot_bytes={
-                g: tuple(p.slot_bytes for p in pools) for g, pools in device_pools.items()
-            },
-            layer_groups=tuple(layer_groups),
-            buffers=tuple(buffers),
-            topology=topology,
-            total_kv_heads_by_layer=total_kv_heads,
-            dtype=self._page_dtype(),
-            quant_mode=self._page_quant_mode(),
-            rebuilds_untransferred=bool(rebuilt),
-            request_rebuilt_roles=self._page_request_rebuilt_roles(),
+        The base manager lays out the roles it registers itself: K/V and their block scales
+        split by KV head, head-major (HND), as the TRTLLM attention kernels write them. A manager
+        registering other roles (``Role.INDEX_KEY`` included) or laying these out otherwise
+        returns its own, usually this one with some fields replaced (``dataclasses.replace``); a
+        role that moves and that its spec does not lay out makes ``get_page_table`` fail rather
+        than guess."""
+        return PageTableSpec(
+            role_layouts={role: ByHead() for role in _HEAD_SPLIT_ROLES},
+            quant_mode={"FP8": "fp8", "NVFP4": "nvfp4"}.get(kv_dtype_name(self)),
         )
-        return ManagerLayout(
-            page_layout=page_layout,
-            tokens_per_block=tokens_per_block * cp_size,
-            pool_group_of=tuple(pg_of_lg),
-            windows=tuple(desc.kept_window for desc in layer_groups),
-            sink_blocks=tuple(desc.num_sink_blocks for desc in layer_groups),
-            recurrent=tuple(desc.kind.per_request for desc in layer_groups),
-            sparse=tuple(has_sparse_buffers(layer_cfg[group[0]]) for group in grouping),
-            layers=tuple(desc.layers for desc in layer_groups),
-            shards=tuple((desc.shard.count, desc.shard.index) for desc in layer_groups),
-            page_bytes={g: sum(p.slot_bytes for p in pools) for g, pools in device_pools.items()},
-            device_pools=device_pools,
-            cp=(cp_rank, cp_size),
-            read_windows=tuple(desc.read_window for desc in layer_groups),
-            named_groups=tuple(
-                not any(is_private_layer(layer_cfg[lid]) for lid in group) for group in grouping
-            ),
-            prefix_required=tuple(
-                not any(is_non_required_layer(layer_cfg[lid]) for lid in group)
-                for group in grouping
-            ),
-            local_layers=tuple(tuple((lid, global_of[lid]) for lid in group) for group in grouping),
-            kv_heads=tuple(kv_heads[group[0]][0] for group in grouping),
-        )
-
-    def _page_layer_configs(self) -> dict[int, AttentionLayerConfig | SsmLayerConfig]:
-        """Internal layer id -> the layer's config, as the manager configured its runtime."""
-        return layer_configs_by_id(self.kv_cache_manager_py_config)
-
-    def _page_layer_ids(self) -> dict[int, tuple[int, int]]:
-        """Internal layer id -> (global layer id, model layer), the same under any pipeline split:
-        the model layer itself, or ``model_layer * num_types + type`` for a manager keeping several
-        caches per model layer (``_virtual_layers``). A manager whose internal layers are numbered
-        otherwise overrides this."""
-        internal = sorted({int(lid) for group in self.impl.layer_grouping for lid in group})
-        virtual = self._virtual_layers()
-        if virtual is None:
-            unnamed = [lid for lid in internal if not 0 <= lid < len(self.pp_layers)]
-            if unnamed:
-                raise ValueError(
-                    f"internal layers {unnamed} are no local layers, and the manager names no "
-                    "model layer for them (_virtual_layers, _page_layer_ids)"
-                )
-            # Internal layer i is the stage's i-th model layer, as layer_offsets numbers it.
-            offsets = getattr(self, "layer_offsets", None)
-            if offsets is not None:
-                renumbered = [
-                    lid for lid in internal if offsets.get(int(self.pp_layers[lid])) != lid
-                ]
-                if renumbered:
-                    raise ValueError(
-                        f"internal layers {renumbered} are not the local index layer_offsets gives "
-                        "their model layers; a manager numbering its layers otherwise names them "
-                        "(_layer_attn_to_layer_id, _page_layer_ids)"
-                    )
-            return {lid: (int(self.pp_layers[lid]),) * 2 for lid in internal}
-        types_of, num_types = virtual
-        unnamed = [lid for lid in internal if lid not in types_of]
-        if unnamed:
-            raise ValueError(
-                f"internal layers {unnamed} have no (model layer, type) in _virtual_layers"
-            )
-        return {
-            lid: (types_of[lid][0] * num_types + types_of[lid][1], types_of[lid][0])
-            for lid in internal
-        }
-
-    def _page_kv_heads(self, layer: int) -> tuple[int, int | None]:
-        """(KV heads on this rank, KV heads over all tensor-parallel ranks or None if unknown) of
-        internal layer ``layer``: those of its model layer (``_page_layer_ids``), 0 heads on this
-        rank for a model layer this pipeline stage does not hold."""
-        model_layer = int(self._page_layer_ids()[layer][1])
-        pp_layers = [int(m) for m in self.pp_layers]
-        per_layer = list(self.num_kv_heads_per_layer or ())
-        index = pp_layers.index(model_layer) if model_layer in pp_layers else len(per_layer)
-        per_rank = int(per_layer[index] or 0) if index < len(per_layer) else 0
-        total = self.num_kv_heads
-        if isinstance(total, int):
-            return per_rank, int(total)
-        if total is None or model_layer >= len(total) or total[model_layer] is None:
-            return per_rank, None
-        return per_rank, int(total[model_layer])
-
-    def _page_buffer_tensors(
-        self, layer_id: int, role: str, size: int, tokens: int, state: bool
-    ) -> tuple[Tensor, ...]:
-        """How the bytes of internal layer ``layer_id``'s ``role`` buffer spread over ranks: the
-        tensors whose local pieces its ``size`` bytes hold, for ``tokens`` tokens of a page, in a
-        layer of recurrent ``state`` or of attention.
-
-        The base manager declares the roles it registers itself: K/V and their block scales
-        head-major (HND) by the layer's KV heads, as the TRTLLM attention kernels write them. A
-        buffer that never moves (``_page_untransferred_roles``, ``_page_derived_roles``) is this
-        rank's own. A manager registering any other role, ``Role.INDEX_KEY`` included, or laying
-        these out otherwise, overrides this method, building tensors with ``page_layout``'s
-        ``head_major``, ``token_major``, ``sectioned`` and ``replicated`` or declaring its own.
-
-        Raises:
-            ValueError: For a role that moves and that the manager does not declare: guessing how
-                its bytes spread would transfer them wrongly between ranks of different parallel
-                sizes.
-        """
-        if role in _HEAD_SPLIT_ROLES:
-            return self._page_head_split(layer_id, size, tokens, state)
-        if role in self._page_untransferred_roles() | self._page_derived_roles():
-            split = self._page_state_split() if state else ("tp",)
-            return owned(size, grid_place(rank_topology(self.mapping), split)[0], split)
-        raise ValueError(
-            f"{type(self).__name__} registers role {role!r} but does not declare how its bytes "
-            "spread over ranks; override _page_buffer_tensors (or list the role in "
-            "_page_untransferred_roles or _page_derived_roles if it never moves)"
-        )
-
-    def _page_head_split(
-        self,
-        layer_id: int,
-        size: int,
-        tokens: int,
-        state: bool,
-        *,
-        head_bytes: Optional[int] = None,
-        total: Optional[int] = None,
-        token_major_: bool = False,
-        dtype: Optional[str] = None,
-    ) -> tuple[Tensor, ...]:
-        """A buffer split by head over the ranks attention splits over (tensor ranks) or recurrent
-        state does (``_page_state_split``): ``size // head_bytes`` heads on this rank of ``total``
-        over all those ranks, head-major or, with ``token_major_``, token-major, of elements of
-        type ``dtype``. By default an attention buffer's heads are the layer's KV heads, of their
-        total, and a recurrent state's split evenly. An attention buffer with heads of its own
-        (``head_bytes``) states their total, which the layer's KV heads do not tell. A buffer
-        whose heads are unknown is this rank's own share."""
-        split = self._page_state_split() if state else ("tp",)
-        ranks, _ = grid_place(rank_topology(self.mapping), split)
-        if head_bytes is None and not state:
-            kv_heads, kv_total = self._page_kv_heads(layer_id)
-            if kv_heads > 0 and size % kv_heads == 0:
-                head_bytes, total = size // kv_heads, kv_total
-        elif head_bytes is not None and not state and total is None:
-            raise ValueError(
-                f"heads of {head_bytes} bytes are an attention buffer's own; state how many lie "
-                "over all tensor ranks (total)"
-            )
-        if head_bytes is None or size % head_bytes:
-            return owned(size, ranks, split)
-        heads = size // head_bytes
-        total = total or heads * ranks
-        if token_major_:
-            return token_major(size, tokens, heads, total, split, dtype=dtype)
-        return head_major(size, heads, total, split, dtype=dtype)
-
-    def _page_state_split(self) -> tuple[str, ...]:
-        """The parallel dimensions recurrent state splits over, as its pools are sized
-        (``mamba_effective_tp_size``): tensor times context ranks under Helix, else tensor ranks,
-        which attention data parallelism makes one rank alone (``grid_place``)."""
-        if self._has_cp_helix and not getattr(self.mapping, "enable_attention_dp", False):
-            return ("tp", "cp")
-        return ("tp",)
-
-    def _page_group_kind(self, layer_group: int, state: bool) -> GroupKind:
-        """How layer group ``layer_group`` addresses a request's pages, which says which of its
-        slots one transfer pairs (``layout_mapping.pair_slots``): one slot per request for
-        recurrent state (``state``), else one per page of its tokens. A manager whose group
-        addresses them otherwise returns a kind of its own (``page_layout.GroupKind``)."""
-        return PerRequest() if state else Paged()
-
-    def _page_untransferred_roles(self) -> frozenset[str]:
-        """Roles whose buffers hold no state a peer needs, such as storage-only buffers that
-        satisfy a pool's layout: they stay in local copies of whole pages but are never moved.
-        None by default. Buffers the receiver rebuilds instead are ``_page_derived_roles``."""
-        return frozenset()
-
-    def _page_derived_roles(self) -> frozenset[str]:
-        """Roles whose buffers derive from the transferred ones: a transfer leaves them for
-        ``rebuild_disagg_imported_cache`` to rebuild after the import. The lender, which rebuilds
-        nothing, lends them with the rest; where the source holds none of them, the importer
-        rebuilds them. None by default; a manager naming any overrides that rebuild, or its page
-        table is refused."""
-        return frozenset()
-
-    def _page_request_rebuilt_roles(self) -> frozenset[str]:
-        """Roles whose buffers this manager, receiving, rebuilds for some requests rather than
-        receiving them (``disagg_untransferred_buffers``), so a peer may hold none of them for a
-        model layer it holds: none by default. A manager naming any overrides
-        ``disagg_untransferred_buffers``, or its page table is refused. A peer missing any other
-        role a model layer both hold transfers is refused, rather than leaving the buffer
-        unwritten."""
-        return frozenset()
-
-    def _page_dtype(self) -> str | None:
-        """The element type of the KV data by name, such as ``"BF16"`` or ``"NVFP4"``; None for a
-        manager declaring none."""
-        dtype = getattr(self, "dtype", None)
-        return None if dtype is None else str(getattr(dtype, "name", dtype))
-
-    def _page_quant_mode(self) -> str | None:
-        """How the KV data is quantized: None unquantized, else ``"fp8"`` or ``"nvfp4"``; a manager
-        with another format (DeepSeek-V4's ``"fp8_ds_mla"``) overrides this."""
-        return {"FP8": "fp8", "NVFP4": "nvfp4"}.get(self._page_dtype())
-
-    def _virtual_layers(self) -> tuple[dict[int, tuple[int, int]], int] | None:
-        """(internal id -> (model layer, attention type), type count) of a manager keeping several
-        caches per model layer, read from its (model layer, type) -> internal id map
-        ``_layer_attn_to_layer_id`` (``page_table.virtual_layers``): the base manager's retained
-        precision twins keep one, as DeepSeek-V4 and CSA2 do. None: one cache per model layer."""
-        return virtual_layers(getattr(self, "_layer_attn_to_layer_id", None))
 
     # -- what a disaggregated transfer of one request moves ------------------------------------------
     # The transceiver asks these of every request; a manager whose caches move differently for some
@@ -3959,7 +3513,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """The buffers, as (global layer id, role), a transfer of this request leaves for the
         receiver to rebuild: none. The receiver's executor rebuilds them, as only CSA2's
         remote-tail replay does today; the transfer does not. Buffers that never move for any
-        request are ``_page_untransferred_roles`` and ``_page_derived_roles``."""
+        request are the ``untransferred_roles`` and ``derived_roles`` of ``page_table_spec``."""
         return frozenset()
 
     def disagg_sends_first_tokens(self, request: LlmRequest) -> bool:
@@ -3989,13 +3543,16 @@ class KVCacheManagerV2(BaseResourceManager):
         """Whether the model keeps recurrent state on any pipeline stage, whichever layers this
         stage holds: this stage's layer configs say so; a manager whose recurrent layers may all
         lie on other stages overrides this."""
-        return any(is_recurrent_layer(config) for config in self._page_layer_configs().values())
+        return any(
+            is_recurrent_layer(config)
+            for config in layer_configs_by_id(self.kv_cache_manager_py_config).values()
+        )
 
     def rebuild_disagg_imported_cache(self, requests: Iterable[LlmRequest]) -> None:
         """Derive, before their first generation step, the caches of requests whose transfer just
         completed that the transfer did not carry: nothing. A manager with such caches, the
-        buffers of its ``_page_derived_roles`` among them, overrides this and calls it through
-        ``super()``."""
+        buffers of the ``derived_roles`` of its ``page_table_spec`` among them, overrides this and
+        calls it through ``super()``."""
 
     @property
     def draft_prompt_lookahead(self) -> int:

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -13,7 +14,7 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, replicated
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
@@ -535,13 +536,10 @@ class DSACacheManagerV2(KVCacheManagerV2):
         """Return the formal V2 page scale and layer offset for sparse MLA."""
         return self._primary_pool_page_index_params[local_layer_idx]
 
-    def _page_buffer_tensors(
-        self, layer_id: int, role: str, size: int, tokens: int, state: bool
-    ) -> Tuple[Tensor, ...]:
+    def page_table_spec(self) -> PageTableSpec:
         """The indexer-K cache projects one head alike on every tensor rank."""
-        if role == Role.INDEX_KEY:
-            return replicated(size)
-        return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
+        spec = super().page_table_spec()
+        return replace(spec, role_layouts={**spec.role_layouts, Role.INDEX_KEY: Replicated()})
 
     def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, List[BufferConfig]]:
         return {

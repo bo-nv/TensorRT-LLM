@@ -891,7 +891,7 @@ def _naming_problems(a: PageLayout, b: PageLayout, groups) -> list[str]:
                 f"model layer {model}'s {role} buffers are transferred by one rank only, as a "
                 "cache attached by what a pipeline stage holds or a role one peer lacks is; only "
                 "a rank rebuilding them per request, as CSA2's replay does "
-                "(_page_request_rebuilt_roles), may hold them alone"
+                "(PageTableSpec.request_rebuilt_roles), may hold them alone"
             )
     return problems
 

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """V2 hybrid cache manager for QSA sparse attention."""
 
+from dataclasses import replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Dict, List, Optional
 
@@ -9,7 +10,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, replicated
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -105,15 +106,15 @@ class QSAMambaHybridCacheManagerV2(MambaHybridCacheManagerV2):
         self.qsa_side_planes_size: Optional[int] = None
         super().__init__(*args, layer_mask=layer_mask, **kwargs)
 
-    def _page_buffer_tensors(
-        self, layer_id: int, role: str, size: int, tokens: int, state: bool
-    ) -> tuple[Tensor, ...]:
+    def page_table_spec(self) -> PageTableSpec:
         """Index positions are request-wide coordinates, so every rank holds the same bytes; so do
         the packed side planes and the index keys, which project one head alike on every rank.
         They carry no head axis, which splitting them by the rank's KV heads would assume."""
-        if role in (QSA_INDEX_POSITION, QSA_SIDE_PLANES, Role.INDEX_KEY):
-            return replicated(size)
-        return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
+        spec = super().page_table_spec()
+        roles = (QSA_INDEX_POSITION, QSA_SIDE_PLANES, Role.INDEX_KEY)
+        return replace(
+            spec, role_layouts={**spec.role_layouts, **{role: Replicated() for role in roles}}
+        )
 
     @cached_property
     def qsa_local_sparse_layer_ids(self) -> List[int]:

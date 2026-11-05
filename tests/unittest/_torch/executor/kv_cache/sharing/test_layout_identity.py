@@ -261,7 +261,7 @@ def test_stages_naming_their_layers_alike_but_holding_other_model_layers_differ_
     Stages named by their model layers differ anyway."""
     first = Manager([kv_group(lids=(0, 1))], pp_layers=[0, 1])
     local = Manager([kv_group(lids=(0, 1))], pp_layers=[2, 3])
-    local._page_layer_ids = lambda: {0: (0, 2), 1: (1, 3)}
+    local.layer_ids = {0: (0, 2), 1: (1, 3)}
     named = Manager([kv_group(lids=(0, 1))], pp_layers=[2, 3])
     ids = [layout_id(derive_layout(m).page_layout) for m in (first, local, named)]
     assert len(set(ids)) == 3
@@ -457,25 +457,14 @@ class Manager:
     """One layer group per entry of ``groups``: ``(layer config class, [internal layer ids],
     [(role, size, override)])``; group ``i`` draws from pool group ``pool_group_of[i]`` (its own by
     default), one pool per role, and has window ``windows[i]`` and ``sinks[i]`` sink tokens. It
-    builds its page table with ``KVCacheManagerV2``'s methods, from the state that manager keeps."""
+    builds its page table with ``KVCacheManagerV2``'s methods, from the state that manager keeps
+    and the spec ``mappers``, ``layouts``, ``ignored`` and ``layer_ids`` say."""
 
     get_page_table = KVCacheManagerV2.get_page_table
-    _page_head_split = KVCacheManagerV2._page_head_split
-    _page_state_split = KVCacheManagerV2._page_state_split
-    _page_group_kind = KVCacheManagerV2._page_group_kind
-    _page_derived_roles = KVCacheManagerV2._page_derived_roles
-    _page_request_rebuilt_roles = KVCacheManagerV2._page_request_rebuilt_roles
     rebuild_disagg_imported_cache = KVCacheManagerV2.rebuild_disagg_imported_cache
     model_has_recurrent_state = KVCacheManagerV2.model_has_recurrent_state
     disagg_state_slot = KVCacheManagerV2.disagg_state_slot
     disagg_pipelined_transfer_blocker = KVCacheManagerV2.disagg_pipelined_transfer_blocker
-    _page_layer_configs = KVCacheManagerV2._page_layer_configs
-    _page_layer_ids = KVCacheManagerV2._page_layer_ids
-    _page_kv_heads = KVCacheManagerV2._page_kv_heads
-    _page_dtype = KVCacheManagerV2._page_dtype
-    _page_quant_mode = KVCacheManagerV2._page_quant_mode
-
-    _virtual_layers = KVCacheManagerV2._virtual_layers
 
     _model_has_attention_window = False
     _model_has_sparse_buffers = False
@@ -484,6 +473,8 @@ class Manager:
     _helix_cp_rank = 0
     _helix_cp_size = 1
     dtype = None
+    # Internal layer id -> (global layer id, model layer); None names them as the base manager does.
+    layer_ids = None
 
     def __init__(
         self,
@@ -568,32 +559,44 @@ class Manager:
         """Attention reads the whole window it keeps."""
         return self.windows[layer_group]
 
-    def _page_buffer_tensors(self, layer_id, role, size, tokens, state):
-        """Each role spread as ``mappers`` names it ("all" for the roles it does not list):
-        "replicated", "owned" by each rank, "sectioned" by ``layouts``' ``section_bytes``, or
-        split by head, "head_major" or "token_major", ``layouts``' ``bytes_per_head`` or the
-        layer's KV heads apart."""
-        kind = self.mappers.get(role, self.mappers["all"])
-        layout = self.layouts.get(role, {})
-        if kind == "replicated":
-            return replicated(size)
-        split = self._page_state_split() if state else ("tp",)
-        ranks, _ = page_layout.grid_place(page_table.rank_topology(self.mapping), split)
-        if kind == "owned":
-            return page_layout.owned(size, ranks, split)
-        if kind == "sectioned":
-            return sectioned(layout["section_bytes"], ranks, split)
-        return self._page_head_split(
-            layer_id,
-            size,
-            tokens,
-            state,
-            head_bytes=layout.get("bytes_per_head"),
-            token_major_=kind == "token_major",
+    def page_table_spec(self):
+        """The base manager's spec with each role laid out as ``mappers`` names it ("all" for the
+        roles it does not list): "replicated", "owned" by each rank, "sectioned" by ``layouts``'
+        ``section_bytes``, or split by head, "head_major" or "token_major", ``layouts``'
+        ``bytes_per_head`` or the layer's KV heads apart; the ``ignored`` roles never move."""
+
+        def laid_out(role):
+            kind = self.mappers.get(role, self.mappers["all"])
+            layout = self.layouts.get(role, {})
+            if kind == "replicated":
+                return page_table.Replicated()
+            if kind == "owned":
+                return page_table.Own()
+            if kind == "sectioned":
+                return page_table.Sectioned(tuple(layout["section_bytes"]))
+            return page_table.ByHead(
+                token_major=kind == "token_major", head_bytes=layout.get("bytes_per_head")
+            )
+
+        named = (set(self.mappers) | set(self.layouts)) - {"all"}
+        return dataclasses.replace(
+            KVCacheManagerV2.page_table_spec(self),
+            role_layouts={role: laid_out(role) for role in named},
+            default_layout=laid_out(None),
+            untransferred_roles=self.ignored,
+            layer_ids=self.layer_ids,
         )
 
-    def _page_untransferred_roles(self):
-        return frozenset(self.ignored)
+
+class BaseDeclarations(Manager):
+    """The stand-in laying out its roles as the base manager does."""
+
+    def page_table_spec(self):
+        return dataclasses.replace(
+            super().page_table_spec(),
+            role_layouts=KVCacheManagerV2.page_table_spec(self).role_layouts,
+            default_layout=None,
+        )
 
 
 def kv_group(lids=(0, 1), heads_per_rank=1, extra=()):
@@ -721,15 +724,16 @@ def test_a_derived_role_a_subclass_adds_needs_its_own_rebuild():
     that rebuild knows only its own roles."""
 
     class Parent(Manager):
-        def _page_derived_roles(self):
-            return frozenset({"v_scale"})
+        def page_table_spec(self):
+            return dataclasses.replace(super().page_table_spec(), derived_roles={"v_scale"})
 
         def rebuild_disagg_imported_cache(self, requests):
             pass
 
     class Adds(Parent):
-        def _page_derived_roles(self):
-            return super()._page_derived_roles() | {"k_scale"}
+        def page_table_spec(self):
+            spec = super().page_table_spec()
+            return dataclasses.replace(spec, derived_roles=spec.derived_roles | {"k_scale"})
 
     class Rebuilds(Adds):
         def rebuild_disagg_imported_cache(self, requests):
@@ -811,8 +815,8 @@ def test_derived_buffers_need_a_rebuild_and_the_lender_moves_them():
     mappers = {"v_scale": "replicated"}
 
     class Derives(Manager):
-        def _page_derived_roles(self):
-            return frozenset({"v_scale"})
+        def page_table_spec(self):
+            return dataclasses.replace(super().page_table_spec(), derived_roles={"v_scale"})
 
     with pytest.raises(ValueError, match=r"derives its \['v_scale'\] buffers .* does not override"):
         Derives(groups, mappers=mappers).get_page_table()
@@ -842,13 +846,13 @@ def test_a_share_covers_the_derived_buffers_the_lender_lends():
     rank holds alike but whose derived buffer is each rank's own is a share per rank."""
 
     class PerRankScales(Manager):
-        def _page_buffer_tensors(self, layer_id, role, size, tokens, state):
-            if role == "v_scale":
-                return page_layout.owned(size, 2)
-            return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
-
-        def _page_derived_roles(self):
-            return frozenset({"v_scale"})
+        def page_table_spec(self):
+            spec = super().page_table_spec()
+            return dataclasses.replace(
+                spec,
+                role_layouts={**spec.role_layouts, "v_scale": page_table.Own()},
+                derived_roles={"v_scale"},
+            )
 
         def rebuild_disagg_imported_cache(self, requests):
             pass
@@ -872,8 +876,8 @@ def test_a_role_rebuilt_per_request_needs_the_hook_naming_those_requests():
     refusal = r"rebuilds its \['swa'\] buffers per request but does not override"
 
     class Declares(Manager):
-        def _page_request_rebuilt_roles(self):
-            return frozenset({"swa"})
+        def page_table_spec(self):
+            return dataclasses.replace(super().page_table_spec(), request_rebuilt_roles={"swa"})
 
     with pytest.raises(ValueError, match=refusal):
         Declares(groups, mappers=mappers).get_page_table()
@@ -998,7 +1002,7 @@ def test_recurrent_state_splits_as_its_pools_are_sized(attention_dp, cp_size, sp
     """Over tensor times context ranks under Helix, else over tensor ranks, and over none under
     attention data parallelism, Helix or not (``mamba_effective_tp_size``)."""
     manager = attention_and_state(2, 1, attention_dp, 4, cp_size, cp_size - 1)
-    assert manager._page_state_split() == split
+    assert page_table.state_split(manager) == split
     state = derive_layout(manager).page_layout.layer_groups[1]
     assert state.kind.per_request and state.shard == shard
 
@@ -1008,12 +1012,9 @@ def test_an_index_key_role_the_manager_does_not_declare_builds_no_page_table():
     """Index-key caches are replicated by some models and split by others, so the base manager
     guesses neither: a manager registering one declares it, as for any role it adds."""
 
-    class Undeclared(Manager):
-        _page_buffer_tensors = KVCacheManagerV2._page_buffer_tensors
-
     with pytest.raises(ValueError, match="registers role 'index_key' but does not declare"):
-        Undeclared([kv_group(lids=(0,), extra=[("index_key", 64, None)])]).get_page_table()
-    layout = Undeclared([kv_group(lids=(0,))]).get_page_table().page_layout
+        BaseDeclarations([kv_group(lids=(0,), extra=[("index_key", 64, None)])]).get_page_table()
+    layout = BaseDeclarations([kv_group(lids=(0,))]).get_page_table().page_layout
     assert {b.role for b in layout.buffers} == {"key", "value"}
 
 
@@ -1021,9 +1022,15 @@ def test_an_index_key_role_the_manager_does_not_declare_builds_no_page_table():
 def test_a_manager_whose_tensors_leave_bytes_of_a_buffer_undescribed_builds_no_page_table():
     """Bytes no tensor describes would never move; the page table refuses them."""
 
+    class Half(page_table.RoleLayout):
+        def tensors(self, site):
+            return replicated(site.size // 2)
+
     class Partial(Manager):
-        def _page_buffer_tensors(self, layer_id, role, size, tokens, state):
-            return replicated(size // 2)
+        def page_table_spec(self):
+            return dataclasses.replace(
+                super().page_table_spec(), role_layouts={}, default_layout=Half()
+            )
 
     with pytest.raises(ValueError, match="hold 32 bytes on this rank, not the 64 bytes"):
         Partial([kv_group(lids=(0,))]).get_page_table()
@@ -1291,7 +1298,7 @@ def test_layers_are_global_ids_stable_across_pipeline_stages():
     assert geometry.page_layout.layer_groups[0].layers == (10, 11)
     assert geometry.layers == ((10, 11),)
     assert {b.layer for b in geometry.page_layout.buffers} == {10, 11}
-    assert manager._page_layer_ids() == {0: (10, 10), 1: (11, 11)}
+    assert page_table.layer_ids_of(manager) == {0: (10, 10), 1: (11, 11)}
     # A manager without the map is refused, not named by its stage-local ids, which another
     # stage reuses for other layers.
     del manager.pp_layers
@@ -1315,7 +1322,7 @@ def test_virtual_layers_are_numbered_by_model_layer_and_attention_type():
         (4, AttentionType.COMPRESSED): 1,
         (5, AttentionType.SLIDING): 2,
     }
-    assert manager._page_layer_ids() == {0: (12, 4), 1: (13, 4), 2: (15, 5)}
+    assert page_table.layer_ids_of(manager) == {0: (12, 4), 1: (13, 4), 2: (15, 5)}
     assert derive_layout(manager).layers == ((12, 13, 15),)
 
 
@@ -1336,7 +1343,7 @@ def test_retained_precision_twins_past_the_local_layers_are_named_by_their_model
         (6, Kind.HIGH_PRECISION): 2,
         (7, Kind.HIGH_PRECISION): 3,
     }
-    assert manager._page_layer_ids() == {0: (12, 6), 1: (14, 7), 2: (13, 6), 3: (15, 7)}
+    assert page_table.layer_ids_of(manager) == {0: (12, 6), 1: (14, 7), 2: (13, 6), 3: (15, 7)}
     assert derive_layout(manager).layers == ((12, 14), (13, 15))
     del manager._layer_attn_to_layer_id
     with pytest.raises(ValueError, match=r"internal layers \[2, 3\] are no local layers"):
@@ -1413,9 +1420,9 @@ def test_mixed_precision_names_a_model_layer_alike_on_every_pipeline_stage():
 
     whole = mixed_precision_stage([0, 1, 2, 3])
     first, last = mixed_precision_stage([0, 1]), mixed_precision_stage([2, 3])
-    assert whole._page_layer_ids() == {0: (0, 0), 1: (2, 1), 2: (4, 2), 3: (6, 3), 4: (1, 0)}
-    assert first._page_layer_ids() == {0: (0, 0), 1: (2, 1), 2: (1, 0)}
-    assert last._page_layer_ids() == {0: (4, 2), 1: (6, 3)}
+    assert page_table.layer_ids_of(whole) == {0: (0, 0), 1: (2, 1), 2: (4, 2), 3: (6, 3), 4: (1, 0)}
+    assert page_table.layer_ids_of(first) == {0: (0, 0), 1: (2, 1), 2: (1, 0)}
+    assert page_table.layer_ids_of(last) == {0: (4, 2), 1: (6, 3)}
     pages = {
         name: m.get_page_table().page_layout
         for name, m in (("whole", whole), ("first", first), ("last", last))
@@ -1447,10 +1454,10 @@ def test_layers_named_for_model_layers_the_stage_lacks_or_alike_are_refused():
     internal layers' buffers of one role alike; a map keyed otherwise, as by local index, is
     refused rather than naming another layer's bytes."""
     manager = Manager([kv_group(lids=(0, 1))], pp_layers=[6, 7])
-    manager._page_layer_ids = lambda: {0: (0, 0), 1: (1, 1)}
+    manager.layer_ids = {0: (0, 0), 1: (1, 1)}
     with pytest.raises(ValueError, match=r"names model layers \[0, 1\], which this pipeline"):
         manager.get_page_table()
-    manager._page_layer_ids = lambda: {0: (6, 6), 1: (6, 7)}
+    manager.layer_ids = {0: (6, 6), 1: (6, 7)}
     with pytest.raises(ValueError, match="internal layers 0 and 1 both name the key buffer"):
         manager.get_page_table()
 
@@ -1518,17 +1525,24 @@ def test_an_attention_buffer_with_heads_of_its_own_states_their_total():
     """One KV head repeated on four tensor ranks says nothing of a buffer split one head per rank
     by heads of its own size: it states their total, or is refused rather than named alike on
     every rank."""
-    starts = set()
-    for rank in range(4):
-        manager = attention(4, rank, 1)
-        with pytest.raises(ValueError, match="state how many lie over all tensor ranks"):
-            manager._page_head_split(0, HEAD_BYTES, TPB, False, head_bytes=HEAD_BYTES)
-        (tensor,) = manager._page_head_split(
-            0, HEAD_BYTES, TPB, False, head_bytes=HEAD_BYTES, total=4
-        )
-        (head,) = [axis for axis in tensor.axes if axis.name == "head"]
-        topology = page_table.rank_topology(manager.mapping)
-        starts.add(page_layout.held(head, topology).start)
+    # A head of K on each of four tensor ranks, of a layer of one KV head.
+    site = page_table.BufferSite(
+        layer=0,
+        role="key",
+        size=HEAD_BYTES,
+        tokens=TPB,
+        state=False,
+        kv_heads=(1, 1),
+        split=("tp",),
+        ranks=4,
+    )
+    with pytest.raises(ValueError, match="state how many lie over all tensor ranks"):
+        page_table.ByHead(head_bytes=HEAD_BYTES).tensors(site)
+    (tensor,) = page_table.ByHead(head_bytes=HEAD_BYTES, total=4).tensors(site)
+    (head,) = [axis for axis in tensor.axes if axis.name == "head"]
+    starts = {
+        page_layout.held(head, RankTopology(tp_size=4, tp_rank=rank)).start for rank in range(4)
+    }
     assert starts == {0, 1, 2, 3}
 
 
@@ -1548,7 +1562,7 @@ def test_an_internal_layer_several_attention_types_share_takes_the_first_s_globa
         (5, AttentionType.SLIDING): 2,
         (5, AttentionType.COMPRESSED): 1,  # shares model layer 4's compressed cache
     }
-    assert manager._page_layer_ids() == {0: (12, 4), 1: (13, 4), 2: (15, 5)}
+    assert page_table.layer_ids_of(manager) == {0: (12, 4), 1: (13, 4), 2: (15, 5)}
     assert derive_layout(manager).layers == ((12, 13, 15),)
 
 
@@ -1596,21 +1610,22 @@ def test_a_declared_read_window_narrows_the_kept_one():
 @pytest.mark.cpu_only
 def test_a_manager_naming_its_own_layers_names_extra_internal_layers():
     """A manager whose internal layers outnumber its model layers (FP4 MLA keeps its tail on
-    extra ones) names them itself (``_page_layer_ids``); a layer it leaves unnamed is refused."""
+    extra ones) names them itself (``PageTableSpec.layer_ids``); a layer it leaves unnamed is
+    refused."""
     manager = Manager(
         [kv_group(lids=(1, 0)), (AttentionLayerConfig, [2, 3], [("tail", 64, None)])],
         pp_layers=[0, 1],
         mappers={"tail": "replicated"},
     )
     named = {1: (2, 1), 0: (0, 0), 2: (1, 0), 3: (3, 1)}
-    manager._page_layer_ids = lambda: named
+    manager.layer_ids = named
     layout = derive_layout(manager).page_layout
     assert [g.layers for g in layout.layer_groups] == [(0, 2), (1, 3)]
     assert {(b.layer, b.role) for b in layout.buffers if b.role == "tail"} == {
         (1, "tail"),
         (3, "tail"),
     }
-    manager._page_layer_ids = lambda: {k: v for k, v in named.items() if k != 3}
+    manager.layer_ids = {k: v for k, v in named.items() if k != 3}
     with pytest.raises(ValueError, match=r"names no global layer for internal layers \[3\]"):
         derive_layout(manager)
 
@@ -1658,7 +1673,7 @@ def test_virtual_layers_publish_the_model_layer_they_belong_to():
         ((12, 15), (4, 5)),
         ((13, 19), (4, 6)),
     ]
-    assert {lid: ids[1] for lid, ids in manager._page_layer_ids().items()} == {
+    assert {lid: ids[1] for lid, ids in page_table.layer_ids_of(manager).items()} == {
         0: 4,
         1: 4,
         2: 5,
@@ -1675,7 +1690,7 @@ def test_layers_a_manager_names_publish_the_model_layers_named_beside_them():
         pp_layers=[0, 1],
         mappers={"tail": "replicated"},
     )
-    manager._page_layer_ids = lambda: {1: (2, 1), 0: (0, 0), 2: (1, 0), 3: (3, 1)}
+    manager.layer_ids = {1: (2, 1), 0: (0, 0), 2: (1, 0), 3: (3, 1)}
     layout = derive_layout(manager).page_layout
     assert [(g.layers, g.model_layers) for g in layout.layer_groups] == [
         ((0, 2), (0, 1)),
@@ -1874,7 +1889,7 @@ def check_buffers(mgr, layout):
         seen[(b.layer, b.role)] = b
         width = layout.pool_slot_bytes[b.pool_group][b.pool_index]
         assert 0 <= b.slot_offset and b.slot_offset + b.size <= width
-    global_of = {lid: ids[0] for lid, ids in mgr._page_layer_ids().items()}
+    global_of = {lid: ids[0] for lid, ids in page_table.layer_ids_of(mgr).items()}
     native = {(global_of[int(bid.layer_id)], str(bid.role)) for bid in mgr.impl.all_buffer_ids}
     assert set(seen) == native
 
@@ -2087,7 +2102,7 @@ def test_retained_precision_twins_describe_their_original_layer_s_head_stride(ki
     ) as mgr:
         layout = derive_layout(mgr).page_layout
         for original, internal in mgr.high_layers.items():
-            global_layer = mgr._page_layer_ids()[internal][0]
+            global_layer = page_table.layer_ids_of(mgr)[internal][0]
             actual = mgr.get_buffers(original, "HND", mixed_precision_pool="high")
             head_bytes = actual.stride(-3) * actual.element_size()
             buffers = [b for b in layout.buffers if b.layer == global_layer]
@@ -2114,10 +2129,11 @@ def test_fp4_mla_installs_its_model_layers_beside_its_layer_ids():
         pp_layers=[4, 7],
     )
     Fp4MlaV2CacheLayoutPolicy.install_manager_capabilities(manager)
-    assert manager._page_layer_ids() == {0: (8, 4), 1: (14, 7), 2: (9, 4), 3: (15, 7)}
+    spec = manager.page_table_spec()
+    assert spec.layer_ids == {0: (8, 4), 1: (14, 7), 2: (9, 4), 3: (15, 7)}
     # Native's transfer skips the V sidecars, which the receiver rebuilds; the page table says so,
     # and a lender, which invokes no rebuild, lends them too.
-    assert manager._page_derived_roles()
+    assert spec.derived_roles
 
 
 M3_TPB = 128
@@ -2310,7 +2326,7 @@ def test_the_deepseek_v4_layout_covers_every_virtual_layer_and_pool(
         # Buffers and layer groups name layers by global layer id: for virtual layers, model layer
         # times the number of attention types plus a type the internal layer holds.
         internal = sorted(int(i) for group in mgr.impl.layer_grouping for i in group)
-        global_of = {lid: ids[0] for lid, ids in mgr._page_layer_ids().items()}
+        global_of = {lid: ids[0] for lid, ids in page_table.layer_ids_of(mgr).items()}
         assert sorted(global_of) == internal and len(set(global_of.values())) == len(internal)
         virtual = mgr._layer_attn_to_layer_id
         num_types = max(t.value for t in type(next(iter(virtual))[1])) + 1
@@ -2744,12 +2760,6 @@ def test_declared_layouts_reshard_byte_for_byte(src_tp, dst_tp):
     assert_layouts_reshard(state_ranks(src_tp), state_ranks(dst_tp))
 
 
-class BaseDeclarations(Manager):
-    """The stand-in declaring its buffers as the base manager does."""
-
-    _page_buffer_tensors = KVCacheManagerV2._page_buffer_tensors
-
-
 @pytest.mark.cpu_only
 def test_a_role_the_manager_does_not_declare_is_refused():
     """The base manager declares only the roles it registers; a role a manager adds without
@@ -2792,12 +2802,17 @@ def test_a_state_group_splits_over_the_grid_its_kind_sets(tp_size, attention_dp)
 def test_a_v2_manager_whose_tensors_overrun_a_buffer_attaches_no_lender(real_manager, monkeypatch):
     """A V2 manager declaring a tensor that reaches past its buffer fails to attach and keeps no
     lender."""
+
+    class Shifted(page_table.RoleLayout):
+        """Each buffer's bytes one byte on: as many as the buffer holds, the last past its end."""
+
+        def tensors(self, site):
+            (whole,) = replicated(site.size)
+            return (dataclasses.replace(whole, offset=1),)
+
     with real_manager() as mgr:
-        monkeypatch.setattr(
-            mgr,
-            "_page_buffer_tensors",
-            lambda layer, role, size, tokens, state: replicated(size + 1),
-        )
+        spec = dataclasses.replace(mgr.page_table_spec(), role_layouts={}, default_layout=Shifted())
+        monkeypatch.setattr(mgr, "page_table_spec", lambda: spec)
         with pytest.raises(ValueError, match="reaches byte"):
             attach_lender(mgr, scope=b"overrun", staging=StagingOptions(64))
         assert mgr._sharing is None
@@ -3026,7 +3041,10 @@ def test_the_quantization_follows_the_element_type_the_manager_declares(dtype, q
     manager = attention(1, 0, 4)
     if dtype is not None:
         manager.dtype = SimpleNamespace(name=dtype)
-    assert (manager._page_dtype(), manager._page_quant_mode()) == (dtype, quant)
+    assert (page_table.kv_dtype_name(manager), manager.page_table_spec().quant_mode) == (
+        dtype,
+        quant,
+    )
 
 
 @pytest.mark.cpu_only
@@ -3038,7 +3056,8 @@ def test_deepseek_v4_names_its_fp8_pages_with_their_scales(ds_mla, quant):
 
     manager = DeepseekV4CacheManager.__new__(DeepseekV4CacheManager)
     manager.dtype, manager.use_fp8_ds_mla = SimpleNamespace(name="FP8"), ds_mla
-    assert manager._page_quant_mode() == quant
+    manager._disagg_ignored_roles = frozenset()
+    assert manager.page_table_spec().quant_mode == quant
 
 
 @pytest.mark.cpu_only

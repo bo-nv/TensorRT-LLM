@@ -2767,22 +2767,29 @@ def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
     assert cold_group.stats.secondary_peak_evictable_num_blocks == 5
 
 
-def test_page_buffer_tensors_default_to_head_major():
-    from types import SimpleNamespace
-
+def test_page_table_spec_defaults_to_head_major():
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
     from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import head_major
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import BufferSite
 
-    manager = object.__new__(KVCacheManagerV2)
-    manager.mapping = SimpleNamespace(tp_size=2, tp_rank=0)
-    manager._page_kv_heads = lambda layer: (2, 4)
+    spec = object.__new__(KVCacheManagerV2).page_table_spec()
+    # K of a layer of 4 KV heads, 2 on this rank of TP2.
+    site = BufferSite(
+        layer=0,
+        role=Role.KEY,
+        size=256,
+        tokens=16,
+        state=False,
+        kv_heads=(2, 4),
+        split=("tp",),
+        ranks=2,
+    )
 
     # K/V default to the TRTLLM head-major layout, split by head over TP. An index-key side cache
     # spreads as its manager says (DSA and MiniMax M3 replicate it, a split one would not), so the
-    # base declares none.
-    assert manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == head_major(256, 2, 4)
-    with pytest.raises(ValueError, match="does not declare how its bytes spread"):
-        manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False)
+    # base lays out none.
+    assert spec.layout_of(Role.KEY).tensors(site) == head_major(256, 2, 4)
+    assert spec.layout_of(Role.INDEX_KEY) is None
 
 
 def test_disagg_request_rules_default_to_the_whole_prompt():
