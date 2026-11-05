@@ -31,12 +31,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaRole
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
+    ByHead,
     LayerGroupDesc,
     PageLayout,
-    head_major,
-    replicated,
-    sectioned,
-    token_major,
+    Replicated,
+    Sectioned,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import (
     page_table_from_dict,
@@ -178,21 +177,13 @@ def _attention_page_table(buffers, pool_slot_bytes):
     )
 
 
-def _kv(layer, role, pool, offset, size=128, tensors=None):
-    """A K/V buffer of 16 tokens of one head, token-major, or ``tensors``."""
-    return BufferDesc(
-        layer,
-        role,
-        0,
-        pool,
-        offset,
-        size,
-        token_major(size, 16, 1, 1) if tensors is None else tensors,
-    )
+def _kv(layer, role, pool, offset, size=128):
+    """A K/V buffer of 16 tokens of one head, token-major."""
+    return BufferDesc(layer, role, 0, pool, offset, size, ByHead(True, size, 1, 16))
 
 
 def _index_key(layer, pool, offset, size=128):
-    return BufferDesc(layer, "index_key", 0, pool, offset, size, replicated(size))
+    return BufferDesc(layer, "index_key", 0, pool, offset, size, Replicated())
 
 
 def test_a_layer_group_transfers_the_pools_holding_its_transferred_buffers():
@@ -227,12 +218,12 @@ def _recurrent_page_table(conv_sections=(16, 16, 32), ple_on_layer=1):
     buffers = []
     for layer in (0, 1):
         # ssm: [2 heads, 4, 4] fp16 = 64 bytes, 32 bytes per head
-        buffers.append(BufferDesc(layer, "ssm_state", 0, 0, 128 * layer, 64, head_major(64, 2, 2)))
-        buffers.append(
-            BufferDesc(layer, "conv_state", 0, 0, 128 * layer + 64, 64, sectioned(conv_sections, 1))
-        )
+        ssm = ByHead(head_bytes=32, total=2)
+        buffers.append(BufferDesc(layer, "ssm_state", 0, 0, 128 * layer, 64, ssm))
+        conv = Sectioned(tuple(conv_sections))
+        buffers.append(BufferDesc(layer, "conv_state", 0, 0, 128 * layer + 64, 64, conv))
     buffers.append(
-        BufferDesc(ple_on_layer, str(MambaRole.PLE_NGRAM_CONTEXT), 0, 1, 0, 32, replicated(32))
+        BufferDesc(ple_on_layer, str(MambaRole.PLE_NGRAM_CONTEXT), 0, 1, 0, 32, Replicated())
     )
     buffers.append(BufferDesc(2, "key", 1, 0, 0, 64))
     buffers.append(BufferDesc(2, "value", 1, 0, 64, 64))
@@ -299,7 +290,7 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
     buffers = []
     for i, layer in enumerate((1, 2)):
         buffers.append(
-            BufferDesc(layer, "conv_state", 0, 0, i * state_bytes, state_bytes, sectioned((64,), 1))
+            BufferDesc(layer, "conv_state", 0, 0, i * state_bytes, state_bytes, Sectioned((64,)))
         )
         buffers.append(
             BufferDesc(
@@ -309,7 +300,7 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
                 0,
                 (num_layers + i) * state_bytes,
                 state_bytes,
-                head_major(state_bytes, 2, 2),
+                ByHead(head_bytes=state_bytes // 2, total=2),
             )
         )
     page_table = _page_table(

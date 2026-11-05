@@ -2769,7 +2769,7 @@ def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
 
 def test_page_table_spec_defaults_to_head_major():
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import head_major
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import ByHead
     from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import BufferSite
 
     spec = object.__new__(KVCacheManagerV2).page_table_spec()
@@ -2788,7 +2788,7 @@ def test_page_table_spec_defaults_to_head_major():
     # K/V default to the TRTLLM head-major layout, split by head over TP. An index-key side cache
     # spreads as its manager says (DSA and MiniMax M3 replicate it, a split one would not), so the
     # base lays out none.
-    assert spec.layout_of(Role.KEY).tensors(site) == head_major(256, 2, 4)
+    assert spec.layout_of(Role.KEY).resolve(site) == ByHead(head_bytes=128, total=4)
     assert spec.layout_of(Role.INDEX_KEY) is None
 
 

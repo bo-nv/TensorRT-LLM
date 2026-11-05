@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``layout_mapping`` against a byte oracle: each rank's page holds, at every byte of every tensor,
-the id of the global element there; after every source rank of an instance sends what
+"""``layout_mapping`` against a byte oracle: each rank's page holds, at every byte of every buffer,
+the id of the byte of its role's space there; after every source rank of an instance sends what
 ``map_buffers`` gives it, every byte a destination rank holds of every buffer both transfer has
-arrived exactly once, holding its own global element, and only from source ranks it pairs with;
+arrived exactly once, holding its own byte of the space, and only from source ranks it pairs with;
 a pairing whose source ranks do not hold everything a destination holds is refused."""
 
 from __future__ import annotations
@@ -36,27 +36,19 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     fan,
     map_buffers,
     merge_runs,
-    owned_indices,
     pair_pages,
     sent_bytes,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
-    Axis,
-    AxisKind,
     BufferDesc,
-    Contiguous,
-    Cyclic,
+    ByHead,
     LayerGroupDesc,
     PageLayout,
-    Progression,
+    Piece,
     RankTopology,
-    Tensor,
-    grid_place,
-    head_major,
-    held,
-    replicated,
-    sectioned,
-    token_major,
+    Replicated,
+    RoleLayout,
+    Sectioned,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -95,42 +87,43 @@ class Instance:
         ]
 
 
-# A buffer spec: (role, topology -> tensors, kind of its layer group).
-Spec = tuple[str, Callable[[RankTopology], tuple], str]
+# A buffer spec: (role, topology -> (bytes, layout), kind of its layer group).
+Spec = tuple[str, Callable[[RankTopology], tuple[int, RoleLayout]], str]
 
 
 def _tp(topology: RankTopology) -> int:
     return 1 if topology.attention_dp else topology.tp_size
 
 
-def kv(total: int, layout: str = "hnd") -> Callable[[RankTopology], tuple]:
-    def tensors(topology):
+def kv(total: int, layout: str = "hnd") -> Callable[[RankTopology], tuple[int, RoleLayout]]:
+    def make(topology):
         heads = -(-total // _tp(topology))
         if layout == "nhd":
-            return token_major(TOKENS * heads * HEAD, TOKENS, heads, total)
-        return head_major(heads * HEAD, heads, total)
+            return heads * TOKENS * HEAD, ByHead(True, TOKENS * HEAD, total, TOKENS)
+        return heads * HEAD, ByHead(head_bytes=HEAD, total=total)
 
-    return tensors
+    return make
 
 
-def state_heads(total: int) -> Callable[[RankTopology], tuple]:
-    def tensors(topology):
+def state_heads(total: int) -> Callable[[RankTopology], tuple[int, RoleLayout]]:
+    def make(topology):
         ranks = _tp(topology) * topology.cp_size
-        return head_major(total // ranks * HEAD, total // ranks, total, ("tp", "cp"))
+        return total // ranks * HEAD, ByHead(head_bytes=HEAD, total=total, split=("tp", "cp"))
 
-    return tensors
+    return make
 
 
-def conv(sections: tuple[int, ...]) -> Callable[[RankTopology], tuple]:
-    def tensors(topology):
+def conv(sections: tuple[int, ...]) -> Callable[[RankTopology], tuple[int, RoleLayout]]:
+    def make(topology):
         ranks = _tp(topology) * topology.cp_size
-        return sectioned([s // ranks for s in sections], ranks, ("tp", "cp"))
+        local = tuple(s // ranks for s in sections)
+        return sum(local), Sectioned(local, split=("tp", "cp"))
 
-    return tensors
+    return make
 
 
-def whole(size: int) -> Callable[[RankTopology], tuple]:
-    return lambda topology: replicated(size)
+def whole(size: int) -> Callable[[RankTopology], tuple[int, RoleLayout]]:
+    return lambda topology: (size, Replicated())
 
 
 def layout(topology: RankTopology, layers: tuple[int, ...], specs: list[Spec]) -> PageLayout:
@@ -143,12 +136,8 @@ def layout(topology: RankTopology, layers: tuple[int, ...], specs: list[Spec]) -
             for role, make, k in specs:
                 if k != kind:
                     continue
-                tensors = make(topology)
-                size = max(
-                    t.offset + 1 + sum((len(held(a, topology)) - 1) * a.stride for a in t.axes)
-                    for t in tensors
-                )
-                buffers.append(BufferDesc(layer, role, g, 0, offset, size, tensors))
+                size, role_layout = make(topology)
+                buffers.append(BufferDesc(layer, role, g, 0, offset, size, role_layout))
                 offset += size
         widths[g] = (offset,)
     groups = tuple(
@@ -169,7 +158,7 @@ def check(
 ) -> None:
     """Every destination rank of every data-parallel group gets each byte it holds exactly once,
     holding the right element, and only from source ranks of its fan; for page ``page`` of a
-    request reaching token position ``end`` where axes of token positions are concerned. The
+    request reaching token position ``end`` where layouts of token positions are concerned. The
     destination's buffers follow ``dst_specs`` where given."""
     sources = [layout(t, src.stages[t.pp_rank], specs) for t in src.ranks(src_dp)]
     destinations = [
@@ -256,38 +245,66 @@ def test_pipeline_stages_pair_by_layer(src_stages, dst_stages, src_tp, dst_tp):
     check(Instance(tp=src_tp, stages=src_stages), Instance(tp=dst_tp, stages=dst_stages), specs)
 
 
-def test_a_two_dimensional_split_reshards_both_axes():
-    """Heads over tensor ranks and tokens over context ranks, which no single split expresses."""
+@dataclass(frozen=True)
+class _HeadsByTokens(RoleLayout):
+    """A layout only this test defines: [token][head][byte] of 8 tokens and 4 heads, heads split
+    over tensor ranks and tokens over context ranks, the ``cp`` context ranks inner."""
 
-    def tensors(topology):
-        heads = 4 // topology.tp_size
-        tokens = 8 // topology.cp_size
-        return (
-            Tensor(
-                (
-                    Axis("token", 8, heads * HEAD, Contiguous(("cp",), tokens)),
-                    Axis("head", 4, HEAD, Contiguous(("tp",), heads)),
-                    Axis("byte", HEAD, 1),
-                )
-            ),
+    name: ClassVar[str] = "test-heads-by-tokens"
+    cp: int = 1
+    split: tuple[str, ...] = ("tp", "cp")
+
+    def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
+        (t, c), tp = divmod(rank, self.cp), ranks // self.cp
+        heads, tokens = 4 // tp, 8 // self.cp
+        return tuple(
+            Piece(((c * tokens + k) * 4 + t * heads) * HEAD, k * heads * HEAD, heads * HEAD)
+            for k in range(tokens)
         )
 
-    specs = [("key", tensors, "attention")]
+    def space(self, size: int, ranks: int) -> tuple:
+        return ("test-heads-by-tokens", 8, 4, HEAD)
+
+
+def test_a_two_dimensional_split_reshards_both_axes():
+    """Heads over tensor ranks and tokens over context ranks, which a layout of its own lays out."""
+
+    def make(topology):
+        return 4 // topology.tp_size * 8 // topology.cp_size * HEAD, _HeadsByTokens(
+            topology.cp_size
+        )
+
+    specs = [("key", make, "attention")]
     for src, dst in [((1, 1), (2, 2)), ((2, 2), (1, 1)), ((2, 1), (1, 2)), ((4, 2), (2, 4))]:
         check(Instance(tp=src[0], cp=src[1]), Instance(tp=dst[0], cp=dst[1]), specs)
+
+
+@dataclass(frozen=True)
+class _Cyclic(RoleLayout):
+    """A layout only this test defines: rank ``r`` of ``n`` holds rows ``r, r + n, ...`` of 12."""
+
+    name: ClassVar[str] = "test-cyclic"
+    split: tuple[str, ...] = ("tp",)
+
+    def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
+        rows = range(rank, 12, ranks)
+        return tuple(Piece(row * HEAD, i * HEAD, HEAD) for i, row in enumerate(rows))
+
+    def space(self, size: int, ranks: int) -> tuple:
+        return ("test-cyclic", 12 * HEAD)
 
 
 def test_a_cyclic_split_hands_each_rank_every_nth_index():
     """A cyclic split reshards to or from a single rank; between other rank counts a destination's
     rows lie outside its fan, which is refused."""
 
-    def tensors(topology):
-        return (Tensor((Axis("row", 12, HEAD, Cyclic(("tp",))), Axis("byte", HEAD, 1))),)
+    def make(topology):
+        return len(range(topology.tp_rank, 12, topology.tp_size)) * HEAD, _Cyclic()
 
     def rows(rank, count):
         return set(range(rank, 12, count))
 
-    specs = [("rows", tensors, "attention")]
+    specs = [("rows", make, "attention")]
     for src_tp, dst_tp in [(1, 3), (3, 1), (2, 2), (2, 4), (4, 2), (3, 2)]:
         if fan_holds(rows, src_tp, dst_tp):
             check(Instance(tp=src_tp), Instance(tp=dst_tp), specs)
@@ -315,18 +332,41 @@ def test_a_whole_page_moves_as_one_run_when_layouts_match():
     assert len(src) == len(maps) and int(sizes.sum()) == page.pool_slot_bytes[0][0]
 
 
-def test_progressions_intersect_by_their_common_residues():
-    a, b = Progression(1, 4, 10), Progression(3, 6, 10)  # 1, 5, 9, ...; 3, 9, 15, ...
-    assert a.intersect(b) == Progression(9, 12, 3)  # 9, 21, 33
-    assert Progression(0, 2, 5).intersect(Progression(1, 2, 5)) is None
-    assert Progression(4, 1, 2).intersect(Progression(0, 1, 4)) is None
+@dataclass(frozen=True)
+class _Pieces(RoleLayout):
+    """A layout only this test defines, holding the pieces it is given on every rank."""
+
+    name: ClassVar[str] = "test-pieces"
+    held: tuple[Piece, ...] = ()
+
+    def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
+        return self.held
+
+    def space(self, size: int, ranks: int) -> tuple:
+        return ("test-pieces",)
 
 
-def test_mismatched_tensors_are_refused():
+def test_pieces_lie_back_to_back_over_their_buffer_and_hold_a_byte_once():
+    def page(*pieces: Piece) -> PageLayout:
+        buffer = BufferDesc(0, "key", 0, 0, 0, 8, _Pieces(pieces))
+        return PageLayout(
+            TOKENS, {0: (8,)}, (LayerGroupDesc("attention", None, 0, 0, (0,)),), (buffer,)
+        )
+
+    page(Piece(4, 0, 4), Piece(0, 4, 4))
+    with pytest.raises(ValueError, match="hold 4 bytes on this rank, not the 8 bytes"):
+        page(Piece(0, 0, 4))
+    with pytest.raises(ValueError, match="do not lie back to back"):
+        page(Piece(0, 0, 4), Piece(4, 5, 4))
+    with pytest.raises(ValueError, match="hold a byte of the space twice"):
+        page(Piece(0, 0, 4), Piece(2, 4, 4))
+
+
+def test_mismatched_spaces_are_refused():
     topology = Instance().ranks(0)[0]
     a = layout(topology, (0,), [("key", kv(4), "attention")])
     b = layout(topology, (0,), [("key", kv(8), "attention")])
-    with pytest.raises(ValueError, match="extent"):
+    with pytest.raises(ValueError, match="space"):
         map_buffers(a, b)
 
 
@@ -355,7 +395,7 @@ def test_layouts_of_one_model_correspond_across_parallelism():
 def test_layouts_that_do_not_correspond_are_refused():
     topology = Instance().ranks(0)[0]
     base = layout(topology, (0,), [("key", kv(4), "attention"), ("ple", whole(12), "state")])
-    with pytest.raises(ValueError, match=r"\(0, 'key'\) tensor '': axes \{'head': 4"):
+    with pytest.raises(ValueError, match=r"\(0, 'key'\): space \('head_major', 4"):
         check_compatible(
             base, layout(topology, (0,), [("key", kv(8), "attention"), ("ple", whole(12), "state")])
         )
@@ -373,7 +413,7 @@ def test_layouts_that_do_not_correspond_are_refused():
     check_compatible(base, layout(topology, (1,), [("key", kv(8), "attention")]))
 
 
-def test_the_oracle_refuses_runs_into_bytes_no_transferred_tensor_holds(monkeypatch):
+def test_the_oracle_refuses_runs_into_bytes_no_transferred_buffer_holds(monkeypatch):
     """Every transferred byte arriving once is not enough: a run into a local-only buffer, or one
     past the slot, fails the oracle too."""
     import utils.page_layout_oracle as oracle
@@ -400,7 +440,7 @@ def test_the_oracle_refuses_runs_into_bytes_no_transferred_tensor_holds(monkeypa
         return runs
 
     monkeypatch.setattr(oracle, "map_buffers", also_writing(width))
-    with pytest.raises(AssertionError, match="written, but no transferred tensor holds it"):
+    with pytest.raises(AssertionError, match="written, but no transferred buffer holds it"):
         oracle.assert_layouts_reshard([page], [page])
     monkeypatch.setattr(oracle, "map_buffers", also_writing(width + 6))
     with pytest.raises(AssertionError):
@@ -413,7 +453,8 @@ def test_the_oracle_gives_layer_groups_sharing_a_pool_group_slots_of_their_own()
     apart rather than counting both writes in one slot."""
     topology = Instance().ranks(0)[0]
     size = 4 * HEAD
-    buffers = tuple(BufferDesc(layer, "key", 0, 0, 0, size, kv(4)(topology)) for layer in (0, 1))
+    _, key = kv(4)(topology)
+    buffers = tuple(BufferDesc(layer, "key", 0, 0, 0, size, key) for layer in (0, 1))
     groups = (
         LayerGroupDesc("attention", None, 0, 0, (0,)),
         LayerGroupDesc("attention", 64, 0, 0, (1,)),
@@ -444,15 +485,13 @@ def test_layouts_whose_bytes_line_up_but_mean_other_things_are_refused():
         dataclasses.replace(
             typed,
             buffers=tuple(
-                dataclasses.replace(
-                    b, tensors=tuple(dataclasses.replace(t, dtype=dtype) for t in b.tensors)
-                )
+                dataclasses.replace(b, layout=dataclasses.replace(b.layout, dtype=dtype))
                 for b in typed.buffers
             ),
         )
         for dtype in ("bfloat16", "float16")
     )
-    with pytest.raises(ValueError, match="'ssm'\\) tensor '': elements of type bfloat16 against"):
+    with pytest.raises(ValueError, match="'ssm'\\): elements of type bfloat16 against"):
         check_compatible(bf16, fp16)
     check_compatible(bf16, bf16)
     with pytest.raises(ValueError, match="a layer group of attention against one of state"):
@@ -681,30 +720,25 @@ def test_a_per_request_group_pairs_its_one_slot_and_paged_groups_pair_with_their
 
 
 @dataclass(frozen=True)
-class _Halves(AxisKind):
-    """A kind only this test defines: rank ``r`` of ``n`` holds the ``r``-th of ``n`` equal runs
-    of the axis. It says which indices each rank holds, and nothing else; no function of
-    page_layout or layout_mapping names it."""
+class _Halves(RoleLayout):
+    """A layout only this test defines: rank ``r`` of ``n`` holds the ``r``-th of ``n`` equal runs
+    of 8 rows. It says which pieces each rank holds, and nothing else; no function of page_layout
+    or layout_mapping names it."""
 
     name: ClassVar[str] = "test-halves"
     split: tuple[str, ...] = ("tp",)
 
-    def indices(self, axis: Axis, topology: RankTopology) -> Progression:
-        n, r = grid_place(topology, self.split)
-        return Progression(r * axis.extent // n, 1, axis.extent // n)
+    def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
+        return (Piece(rank * 8 // ranks * HEAD, 0, size),)
 
-    def count(self, axis: Axis) -> None:
-        return None
+    def space(self, size: int, ranks: int) -> tuple:
+        return ("test-halves", 8 * HEAD)
 
 
-def test_a_new_axis_kind_reshards_from_the_indices_it_says_each_rank_holds():
-    """A kind added beside the others reshards through the same functions, which derive who sends
-    each index from the indices every rank holds."""
-
-    def tensors(topology):
-        return (Tensor((Axis("row", 8, HEAD, _Halves()), Axis("byte", HEAD, 1))),)
-
-    specs = [("rows", tensors, "attention")]
+def test_a_new_layout_reshards_from_the_pieces_it_says_each_rank_holds():
+    """A layout added beside the others reshards through the same functions, which derive who
+    sends each byte from the pieces every rank holds."""
+    specs = [("rows", lambda t: (8 // t.tp_size * HEAD, _Halves()), "attention")]
     for src_tp, dst_tp in [(1, 2), (2, 1), (2, 4), (4, 2), (4, 4)]:
         check(Instance(tp=src_tp), Instance(tp=dst_tp), specs)
     check_compatible(
@@ -714,82 +748,65 @@ def test_a_new_axis_kind_reshards_from_the_indices_it_says_each_rank_holds():
 
 
 @dataclass(frozen=True)
-class _Pairs(AxisKind):
-    """A kind only this test defines whose ranks hold overlapping indices that are not runs: rank
-    ``r`` holds the even indices or the odd ones, ``r`` modulo 2."""
+class _Parity(RoleLayout):
+    """A layout only this test defines whose ranks hold the same pieces out of runs: rank ``r``
+    holds the even rows of 8 or the odd ones, ``r`` modulo 2."""
 
-    name: ClassVar[str] = "test-pairs"
+    name: ClassVar[str] = "test-parity"
     split: tuple[str, ...] = ("tp",)
 
-    def indices(self, axis: Axis, topology: RankTopology) -> Progression:
-        _, r = grid_place(topology, self.split)
-        return Progression(r % 2, 2, len(range(r % 2, axis.extent, 2)))
+    def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
+        rows = range(rank % 2, 8, 2)
+        return tuple(Piece(row * HEAD, i * HEAD, HEAD) for i, row in enumerate(rows))
 
-    def count(self, axis: Axis) -> None:
-        return None
+    def space(self, size: int, ranks: int) -> tuple:
+        return ("test-parity", 8 * HEAD)
 
 
-def test_a_kind_holding_overlapping_indices_not_in_runs_says_who_sends_them():
-    """Who sends an index several ranks hold out of runs is not derived: such a kind is refused
-    until it registers ``owned_indices``, which then decides."""
-
-    def specs(kind):
-        return [
-            (
-                "rows",
-                lambda t: (Tensor((Axis("row", 8, HEAD, kind), Axis("byte", HEAD, 1))),),
-                "attention",
-            )
-        ]
-
-    with pytest.raises(ValueError, match="registers owned_indices"):
-        check(Instance(tp=4), Instance(tp=2), specs(_Pairs()))
-
-    @dataclass(frozen=True)
-    class Decided(_Pairs):
-        name: ClassVar[str] = "test-pairs-decided"
-
-    @owned_indices.register(Decided)
-    def _owned_pairs(kind, axis, pairing, wanted):
-        # Of the paired ranks holding the same parity, the first sends.
-        _, me = pairing.place(kind.split)
-        holders = [r for r in pairing.paired(kind.split) if r % 2 == me % 2]
-        return [held(axis, pairing.src)] if holders[0] == me else []
-
-    check(Instance(tp=4), Instance(tp=2), specs(Decided()))
+def test_ranks_holding_the_same_bytes_out_of_runs_send_each_once():
+    """Which of several paired ranks holding a byte sends it is derived for any pieces: TP4 ranks
+    0 and 2 hold the same even rows, 1 and 3 the odd ones, and each byte reaches TP2 once."""
+    specs = [("rows", lambda t: (4 * HEAD, _Parity()), "attention")]
+    check(Instance(tp=4), Instance(tp=2), specs)
+    check(Instance(tp=2), Instance(tp=2), specs)
 
 
 @dataclass(frozen=True)
-class _PageHead(AxisKind):
-    """A kind of token positions only this test defines: the first ``extent`` positions of each
+class _PageHead(RoleLayout):
+    """A layout of token positions only this test defines: the first ``slots`` positions of each
     page, position ``p`` at index ``p % tokens_per_page``. Each side sizes it as it keeps."""
 
     name: ClassVar[str] = "test-page-head"
     positional: ClassVar[bool] = True
+    slots: int = 1
 
-    def positions(self, axis: Axis, page: int, end: int, tokens_per_page: int) -> range:
+    def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
+        return (Piece(0, 0, size // self.slots),)
+
+    def space(self, size: int, ranks: int) -> tuple:
+        return ("test-page-head", size // self.slots)
+
+    def positions(self, page: int, end: int, tokens_per_page: int) -> range:
         first = page * tokens_per_page
-        return range(first, min(end, first + min(axis.extent, tokens_per_page)))
+        return range(first, min(end, first + min(self.slots, tokens_per_page)))
 
-    def index_of(self, axis: Axis, positions, tokens_per_page: int):
+    def index_of(self, positions, tokens_per_page: int):
         return positions % tokens_per_page
 
-    def corresponds(self, axis: Axis, peer: Axis) -> bool:
-        return isinstance(peer.kind, _PageHead)
+    def stride(self, size: int) -> int:
+        return size // self.slots
 
 
 @pytest.mark.parametrize("src_slots,dst_slots", [(2, 3), (3, 2), (4, 4)])
 @pytest.mark.parametrize("page,end", [(0, 1), (0, 4), (1, 6), (2, 12)])
-def test_a_new_kind_of_token_positions_moves_the_positions_both_sides_hold(
+def test_a_new_layout_of_token_positions_moves_the_positions_both_sides_hold(
     src_slots, dst_slots, page, end
 ):
-    """A kind of token positions says which positions a page holds and where; the positions both
+    """A layout of token positions says which positions a page holds and where; the positions both
     sides hold move, each to its own index, with no rule of its own in layout_mapping."""
 
     def head(slots):
-        return lambda topology: (
-            Tensor((Axis("position", slots, HEAD, _PageHead()), Axis("byte", HEAD, 1))),
-        )
+        return lambda topology: (slots * HEAD, _PageHead(slots))
 
     check(
         Instance(),
@@ -801,10 +818,10 @@ def test_a_new_kind_of_token_positions_moves_the_positions_both_sides_hold(
     )
 
 
-def test_a_kind_of_token_positions_says_which_positions_a_page_holds():
+def test_a_layout_of_token_positions_says_which_positions_a_page_holds():
     with pytest.raises(TypeError, match="does not say which a page holds"):
 
         @dataclass(frozen=True)
-        class _Unsaid(AxisKind):
+        class _Unsaid(RoleLayout):
             name: ClassVar[str] = "test-unsaid"
             positional: ClassVar[bool] = True

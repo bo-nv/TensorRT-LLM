@@ -37,18 +37,19 @@ from .page_layout import (
     PageLayout,
     PerRequest,
     RankTopology,
-    Tensor,
+    check_pieces,
     content_shard,
     grid_place,
-    head_major,
-    held_bytes,
     layout_from_dict,
     layout_to_dict,
-    owned,
-    replicated,
-    sectioned,
-    token_major,
 )
+
+# The role layouts a manager's spec names (page_layout), for managers to import from here.
+from .page_layout import ByHead as ByHead
+from .page_layout import Own as Own
+from .page_layout import Replicated as Replicated
+from .page_layout import RoleLayout as RoleLayout
+from .page_layout import Sectioned as Sectioned
 
 if TYPE_CHECKING:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, SsmLayerConfig
@@ -191,7 +192,7 @@ def is_recurrent_layer(layer_config: AttentionLayerConfig | SsmLayerConfig) -> b
     return isinstance(layer_config, runtime.SsmLayerConfig)
 
 
-def group_kind(layer_config: AttentionLayerConfig | SsmLayerConfig) -> GroupKind:
+def layer_group_kind(layer_config: AttentionLayerConfig | SsmLayerConfig) -> GroupKind:
     """How the layer group of a layer config addresses a request's pages, which says which of its
     slots one transfer pairs (``layout_mapping.pair_slots``): one slot per request for recurrent
     state, else one per page of its tokens. A layer config of a new kind the runtime addresses
@@ -267,7 +268,7 @@ def rank_topology(mapping: object) -> RankTopology:
 
 @dataclass(frozen=True)
 class BufferSite:
-    """One buffer as a role layout sees it.
+    """One buffer as a manager's spec leaves it to its role layout (``RoleLayout.resolve``).
 
     Attributes:
         layer: The manager's internal layer id.
@@ -289,91 +290,6 @@ class BufferSite:
     kv_heads: tuple[int, int | None]
     split: tuple[str, ...]
     ranks: int
-
-
-class RoleLayout:
-    """How the bytes of a role's buffers spread over ranks: the tensors whose local pieces a
-    buffer holds (``BufferSite``). The layouts below cover the managers' roles; a role laid out
-    otherwise takes a subclass."""
-
-    def tensors(self, site: BufferSite) -> tuple[Tensor, ...]:
-        raise NotImplementedError
-
-
-@dataclass(frozen=True)
-class ByHead(RoleLayout):
-    """Split by head over the buffer's ranks, head-major or, with ``token_major``, token-major.
-
-    An attention buffer's heads are by default the layer's KV heads: K of a layer of 8 KV heads on
-    TP2 holds 4 heads of ``size // 4`` bytes. A buffer of heads of its own states their bytes
-    (``head_bytes``), and for attention their total over all ranks (``total``); recurrent state's
-    total is its heads on this rank times the ranks. A buffer whose heads are unknown, or whose
-    size they do not divide, is this rank's own share (``owned``).
-
-    Attributes:
-        token_major: Tokens outermost ([token, head, ...], NHD) rather than heads (HND).
-        head_bytes: Bytes of one head; None for the layer's KV heads.
-        total: Heads over all ranks of an attention buffer with ``head_bytes``.
-        dtype: The type of the elements by name, or None.
-    """
-
-    token_major: bool = False
-    head_bytes: int | None = None
-    total: int | None = None
-    dtype: str | None = None
-
-    def tensors(self, site: BufferSite) -> tuple[Tensor, ...]:
-        head_bytes, total = self.head_bytes, self.total
-        if head_bytes is None and not site.state:
-            kv_heads, kv_total = site.kv_heads
-            if kv_heads > 0 and site.size % kv_heads == 0:
-                head_bytes, total = site.size // kv_heads, kv_total
-        elif head_bytes is not None and not site.state and total is None:
-            raise ValueError(
-                f"heads of {head_bytes} bytes are an attention buffer's own; state how many lie "
-                "over all tensor ranks (total)"
-            )
-        if head_bytes is None or site.size % head_bytes:
-            return owned(site.size, site.ranks, site.split)
-        heads = site.size // head_bytes
-        total = total or heads * site.ranks
-        if self.token_major:
-            return token_major(site.size, site.tokens, heads, total, site.split, dtype=self.dtype)
-        return head_major(site.size, heads, total, site.split, dtype=self.dtype)
-
-
-@dataclass(frozen=True)
-class Replicated(RoleLayout):
-    """The whole buffer alike on every rank, as an index-K cache is."""
-
-    def tensors(self, site: BufferSite) -> tuple[Tensor, ...]:
-        return replicated(site.size)
-
-
-@dataclass(frozen=True)
-class Sectioned(RoleLayout):
-    """Consecutive sections, each this rank's share of its own tensor split by byte over the
-    buffer's ranks, as Mamba2's conv state ``[x | B | C]`` is.
-
-    Attributes:
-        section_bytes: Bytes of each section on this rank, in order.
-        dtype: The type of the elements by name, or None.
-    """
-
-    section_bytes: tuple[int, ...]
-    dtype: str | None = None
-
-    def tensors(self, site: BufferSite) -> tuple[Tensor, ...]:
-        return sectioned(self.section_bytes, site.ranks, site.split, dtype=self.dtype)
-
-
-@dataclass(frozen=True)
-class Own(RoleLayout):
-    """This rank's own share of the buffer's ranks, which pairs only with the same rank's: the
-    layout of a buffer that never moves."""
-
-    def tensors(self, site: BufferSite) -> tuple[Tensor, ...]:
-        return owned(site.size, site.ranks, site.split)
 
 
 def _frozen_roles(roles) -> frozenset[str]:
@@ -578,7 +494,7 @@ def build_page_table(manager: object) -> ManagerLayout:
     Raises:
         ValueError: If its layer groups, layer configs and spec do not agree: a layer without a
             global id or of a model layer the stage does not hold, a role that moves and that the
-            spec does not lay out, tensors that do not cover their buffer, two internal layers
+            spec does not lay out, pieces that do not cover their buffer, two internal layers
             naming one buffer, a derived role without a rebuild, or a read window outside the
             kept window.
     """
@@ -705,7 +621,7 @@ def build_page_table(manager: object) -> ManagerLayout:
         names = sorted((global_of[lid], model_of[lid]) for lid in group)
         layer_groups.append(
             LayerGroupDesc(
-                kind=group_kind(first),
+                kind=layer_group_kind(first),
                 kept_window=window,
                 num_sink_blocks=-(-sink_tokens // tokens_per_block),
                 pool_group=g,
@@ -776,9 +692,10 @@ def _describe_buffer(
     """One buffer of the page layout, laid out as the spec says.
 
     Raises:
-        ValueError: If the spec lays out no role that moves, the role's tensors do not cover the
-            buffer on this rank, or a buffer of several sub-pages per block that moves splits
-            over ranks other than as each rank's own share.
+        ValueError: If the spec lays out no role that moves, the role's layout does not fit the
+            buffer or its pieces on this rank do not lie back to back over it, or a buffer of
+            several sub-pages per block that moves splits over ranks other than as each rank's
+            own share.
     """
     where = f"buffer ({site.layer}, {site.role})"
     layout = spec.layout_of(site.role)
@@ -789,24 +706,20 @@ def _describe_buffer(
             "untransferred_roles or derived_roles if it never moves)"
         )
     try:
-        tensors = layout.tensors(site)
-        declared = sum(held_bytes(t, topology) for t in tensors)
+        layout = layout.resolve(site)
+        layout.check(site.size)
+        check_pieces(layout, site.size, *grid_place(topology, layout.split))
     except ValueError as error:
         raise ValueError(f"{where}: {error}") from error
-    if declared != site.size:
-        # Bytes no tensor describes would never move, or be moved twice.
-        raise ValueError(
-            f"{where}: its tensors hold {declared} bytes on this rank, not the {site.size} bytes "
-            "of its slot"
-        )
     if (
         expansion != 1
         and transferred
         and site.role not in spec.derived_roles
-        and any(t.split and t.name != "own" for t in tensors)
+        and layout.split
+        and not isinstance(layout, Own)
     ):
-        # Its tensors describe one page; ranks holding parts of several sub-pages would pair
-        # bytes of different sub-pages. A rank's own share pairs only with the same rank's, whole.
+        # Its pieces describe one page; ranks holding parts of several sub-pages would pair bytes
+        # of different sub-pages. A rank's own share pairs only with the same rank's, whole.
         raise ValueError(
             f"{where}: {expansion} sub-pages per block that move are declarable only replicated "
             "or as each rank's own share"
@@ -819,7 +732,7 @@ def _describe_buffer(
         pool_index=index,
         slot_offset=offset,
         size=site.size,
-        tensors=tensors,
+        layout=layout,
         transferred=transferred,
         expansion=expansion,
     )

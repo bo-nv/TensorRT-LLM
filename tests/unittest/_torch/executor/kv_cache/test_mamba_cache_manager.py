@@ -3687,7 +3687,7 @@ def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
         conv = next(
             b for b in page_table.page_layout.buffers if b.role == str(MambaRole.CONV_STATE)
         )
-        assert [t.axes[0].held for t in conv.tensors] == [
+        assert list(conv.layout.section_bytes) == [
             dim * d_conv_m1 * conv_elem_size for dim in mgr.conv_section_dims
         ]
         assert mgr.conv_section_dims == [8, 8, 32]

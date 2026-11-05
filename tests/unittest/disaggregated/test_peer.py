@@ -31,13 +31,12 @@ from tensorrt_llm._torch.disaggregation.native.runs import RunsMapper
 from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import BufferRuns
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
+    ByHead,
     LayerGroupDesc,
     PageLayout,
     RankTopology,
-    head_major,
-    replicated,
-    sectioned,
-    token_major,
+    Replicated,
+    Sectioned,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -84,13 +83,13 @@ def make_page_table(
 
     size = block_bytes[0] // (len(global_layer_ids) * 2)
     if attention == "replicated":
-        kv_tensors = replicated(size)
+        kv_layout = Replicated()
     elif attention == "token_major":
-        kv_tensors = token_major(size, tokens_per_block, kv_heads, total_heads)
+        kv_layout = ByHead(True, size // kv_heads, total_heads, tokens_per_block)
     else:
-        kv_tensors = head_major(size, kv_heads, total_heads)
+        kv_layout = ByHead(head_bytes=size // kv_heads, total=total_heads)
     buffers = [
-        BufferDesc(layer, role, 0, 0, (2 * i + j) * size, size, kv_tensors)
+        BufferDesc(layer, role, 0, 0, (2 * i + j) * size, size, kv_layout)
         for i, layer in enumerate(global_layer_ids)
         for j, role in enumerate(("key", "value"))
     ]
@@ -105,7 +104,7 @@ def make_page_table(
                 1,
                 i * index_key_bytes,
                 index_key_bytes,
-                replicated(index_key_bytes),
+                Replicated(),
             )
             for i, layer in enumerate(global_layer_ids)
         )
@@ -117,7 +116,7 @@ def make_page_table(
     for i, layer in enumerate(MAMBA_LAYERS):
         buffers.append(
             BufferDesc(
-                layer, "conv_state", 1, 0, i * conv_bytes, conv_bytes, sectioned(sections, mamba_tp)
+                layer, "conv_state", 1, 0, i * conv_bytes, conv_bytes, Sectioned(tuple(sections))
             )
         )
         buffers.append(
@@ -128,7 +127,7 @@ def make_page_table(
                 1,
                 i * ssm_bytes,
                 ssm_bytes,
-                head_major(ssm_bytes, ssm_bytes // SSM_HEAD_BYTES, 4096 // SSM_HEAD_BYTES),
+                ByHead(head_bytes=SSM_HEAD_BYTES, total=4096 // SSM_HEAD_BYTES),
             )
         )
     if side_state_bytes is not None:
@@ -142,7 +141,7 @@ def make_page_table(
                     2,
                     i * side_state_bytes,
                     side_state_bytes,
-                    replicated(side_state_bytes),
+                    Replicated(),
                 )
             )
 
@@ -1026,7 +1025,7 @@ def test_side_state_of_another_size_is_refused():
         make_rankinfo(instance_name="local", page_table=make_page_table(side_state_bytes=8))
     )
     peer_ri = make_rankinfo(instance_name="peer", page_table=make_page_table(side_state_bytes=16))
-    with pytest.raises(ValueError, match="'byte': 8.*'byte': 16"):
+    with pytest.raises(ValueError, match=r"\('replicated', 8\) against \('replicated', 16\)"):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 

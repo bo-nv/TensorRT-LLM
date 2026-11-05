@@ -14,59 +14,54 @@
 # limitations under the License.
 """How two ranks' pages correspond, read from their page layouts alone.
 
-A page layout says, for every buffer, which global indices of each tensor axis a rank holds
-(``page_layout.held``). From a source's and a destination's layouts this module derives what the
-source sends; nothing here names a cache, a model or an axis kind:
+A buffer's layout (``page_layout.RoleLayout``) says which pieces of its role's space a rank holds.
+From a source's and a destination's layouts this module derives what the source sends; nothing
+here names a cache, a model or a layout:
 
 - ``fan``: which source ranks a destination hears from, by each dimension's shares of ranks.
-- ``owned_indices``: which indices of an axis a source rank sends, from the indices every rank
-  holds (``AxisKind.indices``).
-- ``map_buffers``: the byte runs of every buffer both ranks transfer, once per pair of ranks.
-- ``page_runs``: what one page moves; for an axis of token positions, every position both sides
-  hold (``AxisKind.positions``) moved to its own index on each side (``AxisKind.index_of``).
+- ``map_buffers``: the byte runs of every buffer both ranks transfer, once per pair of ranks: each
+  byte of the space the destination holds comes from the elected one of the paired source ranks
+  holding it.
+- ``page_runs``: what one page moves; for a layout of token positions, every position both sides
+  hold (``RoleLayout.positions``) moved to its own index on each side (``RoleLayout.index_of``).
 - ``pair_pages``: which slots of a request pair in one transfer, as the layer group's kind says.
 - ``check_compatible``: whether two ranks' layouts may pair at all.
 
 Example: K of one layer, 8 KV heads of 256 bytes, head-major, from TP2 to TP4. Destination rank 1
-holds heads 2..3. It hears from source rank 0 alone (``fan(2, 4, 1) == range(0, 1)``), which holds
-heads 0..3 and sends heads 2..3 as one run of 512 bytes.
+holds heads 2..3, bytes 512..1023 of the space. It hears from source rank 0 alone
+(``fan(2, 4, 1) == range(0, 1)``), which holds heads 0..3 and sends heads 2..3 as one run of 512
+bytes.
 
-Election: where several paired source ranks hold an index (heads every rank keeps, or a dimension
-no axis of the tensor splits), the one at position ``key`` modulo their count sends it, ``key``
-being the destination's attention data-parallel rank, so that the destinations of several
-data-parallel groups spread over the sources. A destination holding an index no paired source rank
-holds, as an uneven head split can make, is refused rather than left without it.
+Election: where several paired source ranks hold a byte (heads every rank keeps, or a dimension the
+layout does not split over), the one at position ``key`` modulo their count sends it, ``key`` being
+the destination's attention data-parallel rank, so that the destinations of several data-parallel
+groups spread over the sources. A destination holding a byte no paired source rank holds, as an
+uneven head split can make, is refused rather than left without it.
 
-Adding a kind: an axis kind in ``page_layout`` says which indices each rank holds, or which token
-positions a page holds and at which index; this module derives the rest. Only a kind whose ranks
-hold overlapping indices that are not runs registers its own ``owned_indices``. A layer-group kind
-registers which slots pair (``pair_slots``).
+Adding a layout: a ``RoleLayout`` subclass says which pieces of the space each rank holds; this
+module derives the rest. A layer-group kind registers which slots pair (``pair_slots``).
 """
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import itertools
 from dataclasses import dataclass
-from typing import Mapping, NamedTuple, Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
 from .page_layout import (
     GRID_DIMENSIONS,
-    Axis,
-    AxisKind,
     BufferDesc,
     GroupKind,
     Paged,
     PageLayout,
     PerRequest,
-    Progression,
+    Piece,
     RankTopology,
-    Tensor,
+    RoleLayout,
     grid_place,
-    held,
 )
 
 __all__ = [
@@ -80,7 +75,6 @@ __all__ = [
     "layer_group_of",
     "map_buffers",
     "merge_runs",
-    "owned_indices",
     "page_runs",
     "pair_pages",
     "pair_slots",
@@ -156,25 +150,15 @@ class Pairing:
         places = itertools.product(*(self.fans[dim] for dim in split))
         return sorted({_flat(coords, sizes) for coords in places})
 
-    def at(self, split: Sequence[str], rank: int) -> RankTopology:
-        """The source's topology moved to place ``rank`` of the grid of ``split``, to ask a kind
-        what another source rank holds."""
-        sizes = [grid_place(self.src, (dim,))[0] for dim in split]
-        changes = {}
-        for dim, size in reversed(list(zip(split, sizes))):
-            rank, coord = divmod(rank, size)
-            if size > 1:
-                changes[f"{dim}_rank"] = coord
-        return dataclasses.replace(self.src, **changes)
-
     def elect(self, candidates: Sequence):
         """The one of ``candidates`` that sends: the one at ``key`` modulo their count."""
         return candidates[self.key % len(candidates)]
 
-    def sends_replicas(self, tensor: Tensor) -> bool:
-        """Whether this source rank sends ``tensor`` along the dimensions none of its axes splits,
-        whose ranks hold it alike: whether it is the elected one of the paired ranks there."""
-        free = [dim for dim in GRID_DIMENSIONS if all(dim not in a.split for a in tensor.axes)]
+    def sends_replicas(self, split: Sequence[str]) -> bool:
+        """Whether this source rank sends a buffer along the dimensions its layout does not split
+        over (``split`` being those it does), whose ranks hold it alike: whether it is the elected
+        one of the paired ranks there."""
+        free = [dim for dim in GRID_DIMENSIONS if dim not in split]
         if not free:
             return True
         mine = tuple(grid_place(self.src, (dim,))[1] for dim in free)
@@ -188,113 +172,37 @@ def _flat(coords: Sequence[int], sizes: Sequence[int]) -> int:
     return rank
 
 
-@functools.singledispatch
-def owned_indices(
-    kind: AxisKind, axis: Axis, pairing: Pairing, wanted: Progression
-) -> list[Progression]:
-    """The runs of ``axis``' indices that the source rank sends, derived from the indices each
-    source rank holds (``AxisKind.indices``): of those it holds, the ones it is elected for among
-    the paired source ranks holding them.
-
-    8 heads split contiguously from TP4 to TP2: destination rank 0 hears from source ranks 0 and 1,
-    holding heads 0..1 and 2..3, and each sends its own. Where ranks hold overlapping runs, as 6
-    heads over 4 ranks of 2 heads each, every index goes to one of its holders (``Pairing.elect``);
-    where each index lies on one rank alone, as ``Cyclic`` places them, that rank sends it.
-
-    A kind whose ranks hold overlapping indices that are not runs registers its own.
-
-    Args:
-        kind: ``axis.kind``, on whose type this dispatches.
-        axis: The source's axis.
-        pairing: The source rank and the destination it sends to.
-        wanted: The indices of ``axis`` the destination holds.
-
-    Raises:
-        ValueError: If the destination holds an index no paired source rank holds, or the ranks
-            of ``kind`` hold overlapping indices that are not runs.
-    """
-    if not kind.split:
-        return [held(axis, pairing.src)]
-    n, me = pairing.place(kind.split)
-    paired = pairing.paired(kind.split)
-    holdings = [kind.indices(axis, pairing.at(kind.split, rank)) for rank in range(n)]
-    if all(h.step == 1 or h.count <= 1 for h in holdings):
-        return _elect_runs(axis, holdings, paired, me, pairing, wanted)
-    if all(a.intersect(b) is None for a, b in itertools.combinations(holdings, 2)):
-        for rank in range(n):
-            if rank not in paired:
-                _refuse_unpaired(axis, holdings[rank], wanted)
-        return [holdings[me]] if me in paired else []
-    raise ValueError(
-        f"axis {axis.name!r}: the ranks of kind {kind.name!r} hold overlapping indices that are "
-        "not runs, so which rank sends each is the kind's to say: it registers owned_indices"
-    )
-
-
-def _elect_runs(
-    axis: Axis,
-    holdings: Sequence[Progression],
-    paired: Sequence[int],
-    me: int,
-    pairing: Pairing,
-    wanted: Progression,
-) -> list[Progression]:
-    """``owned_indices`` where every rank holds one run: each stretch between the runs' bounds goes
-    to the elected one of the paired ranks whose runs cover it."""
-    runs = [(h.start, h.start + h.count) for h in holdings]
-    bounds = sorted({0, axis.extent} | {min(b, axis.extent) for run in runs for b in run})
-    out: list[Progression] = []
-    for lo, hi in zip(bounds, bounds[1:]):
-        holders = [rank for rank in paired if runs[rank][0] <= lo and hi <= runs[rank][1]]
-        if not holders:
-            _refuse_unpaired(axis, Progression(lo, 1, hi - lo), wanted)
-            continue
-        if pairing.elect(holders) != me:
-            continue
-        if out and out[-1].last + 1 == lo:
-            out[-1] = Progression(out[-1].start, 1, out[-1].count + hi - lo)
-        else:
-            out.append(Progression(lo, 1, hi - lo))
-    return out
-
-
-def _refuse_unpaired(axis: Axis, indices: Progression, wanted: Progression) -> None:
-    """Raise if the destination holds any of ``indices``, which no paired source rank holds."""
-    missing = indices.intersect(wanted)
-    if missing is not None:
-        raise ValueError(
-            f"axis {axis.name!r} (extent {axis.extent}, split over {axis.split}): index "
-            f"{missing.start} of the destination is held by no source rank it pairs with"
-        )
-
-
 @dataclass(frozen=True)
 class PositionRule:
-    """How a buffer's runs move with the token positions a page holds: its axis of token positions
-    on the source and on the destination. A position both sides hold of a page
-    (``AxisKind.positions``) moves from its index on the source to its index on the destination
-    (``AxisKind.index_of``).
+    """How a buffer's runs move with the token positions a page holds: its layout on the source and
+    on the destination. A position both sides hold of a page (``RoleLayout.positions``) moves from
+    its index on the source to its index on the destination (``RoleLayout.index_of``), ``stride``
+    bytes per index on each.
 
-    In pages of 32 tokens, of page 1 (positions 32..63) written up to position 50: a source axis
-    holding 34..49 and a destination axis holding 32..49 move 34..49, position 40 from the index
-    the source's kind gives it to the index the destination's kind gives it.
+    In pages of 32 tokens, of page 1 (positions 32..63) written up to position 50: a source layout
+    holding 34..49 and a destination layout holding 32..49 move 34..49, position 40 from the index
+    the source's layout gives it to the index the destination's layout gives it.
 
     Attributes:
-        src: The source's axis of token positions.
-        dst: The destination's axis of the same name.
+        src: The source's layout.
+        dst: The destination's layout.
+        src_stride: Bytes per index on the source.
+        dst_stride: Bytes per index on the destination.
         tokens_per_page: Token positions of one page.
     """
 
-    src: Axis
-    dst: Axis
+    src: RoleLayout
+    dst: RoleLayout
+    src_stride: int
+    dst_stride: int
     tokens_per_page: int
 
     def positions(self, page: int, window: TransferWindow) -> np.ndarray:
         """The token positions of page ``page`` (its position among a request's pages, from 0)
         that both sides hold once the request has written every position below ``window.end``,
         as int64."""
-        src = self.src.kind.positions(self.src, page, window.end, self.tokens_per_page)
-        dst = self.dst.kind.positions(self.dst, page, window.end, self.tokens_per_page)
+        src = self.src.positions(page, window.end, self.tokens_per_page)
+        dst = self.dst.positions(page, window.end, self.tokens_per_page)
         return np.intersect1d(np.asarray(src, dtype=np.int64), np.asarray(dst, dtype=np.int64))
 
     @property
@@ -304,11 +212,10 @@ class PositionRule:
         return int(self.positions(0, TransferWindow(0, self.tokens_per_page)).size)
 
     def offsets(self, positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Each position's byte offset from index 0 of the axis, on the source and on the
-        destination."""
-        src_index = self.src.kind.index_of(self.src, positions, self.tokens_per_page)
-        dst_index = self.dst.kind.index_of(self.dst, positions, self.tokens_per_page)
-        return src_index * self.src.stride, dst_index * self.dst.stride
+        """Each position's byte offset from index 0, on the source and on the destination."""
+        src_index = self.src.index_of(positions, self.tokens_per_page)
+        dst_index = self.dst.index_of(positions, self.tokens_per_page)
+        return src_index * self.src_stride, dst_index * self.dst_stride
 
 
 @dataclass(frozen=True, eq=False)
@@ -365,104 +272,77 @@ def page_runs(
     return merge_runs(src.ravel(), dst.ravel(), sizes)
 
 
-class _AxisPart(NamedTuple):
-    """One axis of a tensor as the source sends it."""
+def _arrays(pieces: Sequence[Piece]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``pieces`` as int64 arrays of coordinates, offsets and sizes, in order of coordinate."""
+    ordered = sorted(pieces, key=lambda p: p.at)
+    return tuple(
+        np.fromiter((getattr(p, name) for p in ordered), dtype=np.int64, count=len(ordered))
+        for name in ("at", "offset", "size")
+    )
 
-    src_axis: Axis
-    dst_axis: Axis
-    src_held: Progression  # the indices the source holds, in its local order
-    dst_held: Progression  # the indices the destination holds, in its local order
-    sent: list[Progression]  # runs of indices the source sends that the destination holds
+
+def _covering(pieces: tuple[np.ndarray, ...], lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+    """For each stretch ``[lo[i], hi[i])`` of the space, the index of the piece of ``pieces``
+    (``_arrays``) holding it whole, -1 where none does."""
+    at, _, size = pieces
+    if at.size == 0:
+        return np.full(lo.size, -1, dtype=np.int64)
+    k = np.searchsorted(at, lo, side="right") - 1
+    clamped = np.maximum(k, 0)
+    held = (k >= 0) & (hi <= at[clamped] + size[clamped])
+    return np.where(held, k, -1)
 
 
-def _tensor_runs(
-    src_buffer: BufferDesc,
-    src_tensor: Tensor,
-    dst_buffer: BufferDesc,
-    dst_tensor: Tensor,
-    pairing: Pairing,
-    dst: RankTopology,
-) -> list[tuple[np.ndarray, np.ndarray, int]]:
-    """What the source sends of one tensor: per box of indices it sends (one run of sent indices
-    per axis), the source offsets, destination offsets and size of its runs; none when it sends
-    nothing of the tensor."""
-    where = f"buffer ({src_buffer.layer}, {src_buffer.role}) tensor {src_tensor.name!r}"
-    dst_axes = {a.name: a for a in dst_tensor.axes}
-    if set(dst_axes) != {a.name for a in src_tensor.axes}:
+def _layout_runs(
+    src: BufferDesc, dst: BufferDesc, pairing: Pairing, dst_topology: RankTopology
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """What the source sends of one buffer: the bytes of the space the destination holds that the
+    source is the elected sender of, as offsets within each side's buffer and sizes; None when it
+    sends none.
+
+    The space is cut at every piece's bounds on either side, so each stretch lies whole in one
+    piece of every rank holding it; each stretch the destination holds goes from the elected one
+    of the paired source ranks holding it (``Pairing.elect``).
+
+    Raises:
+        ValueError: If the destination holds a byte no paired source rank holds.
+    """
+    split = src.layout.split
+    if not pairing.sends_replicas(split):
+        return None
+    ranks, me = pairing.place(split)
+    places = pairing.paired(split)
+    held = [_arrays(src.layout.pieces(src.size, ranks, place)) for place in places]
+    want = _arrays(dst.layout.pieces(dst.size, *grid_place(dst_topology, dst.layout.split)))
+    edges = np.unique(
+        np.concatenate(
+            [want[0], want[0] + want[2], *(h[0] for h in held), *(h[0] + h[2] for h in held)]
+        )
+    )
+    lo, hi = edges[:-1], edges[1:]
+    into = _covering(want, lo, hi)
+    lo, hi, into = lo[into >= 0], hi[into >= 0], into[into >= 0]
+    cover = np.stack([_covering(h, lo, hi) for h in held])
+    holders = cover >= 0
+    count = holders.sum(axis=0)
+    if (count == 0).any():
+        i = int(np.argmax(count == 0))
         raise ValueError(
-            f"{where}: axes {[a.name for a in src_tensor.axes]} against {list(dst_axes)}"
+            f"buffer ({src.layer}, {src.role}): bytes {int(lo[i])}..{int(hi[i]) - 1} of its space, "
+            "which the destination holds, are held by no source rank it pairs with"
         )
-    if not pairing.sends_replicas(src_tensor):
-        return []
-    parts = []
-    for src_axis in src_tensor.axes:
-        dst_axis = dst_axes[src_axis.name]
-        if src_axis.extent != dst_axis.extent:
-            raise ValueError(
-                f"{where} axis {src_axis.name}: extent {src_axis.extent} against {dst_axis.extent}"
-            )
-        src_held, dst_held = held(src_axis, pairing.src), held(dst_axis, dst)
-        sent = []
-        for owned in owned_indices(src_axis.kind, src_axis, pairing, dst_held):
-            part = owned.intersect(src_held)
-            part = None if part is None else part.intersect(dst_held)
-            if part is not None:
-                sent.append(part)
-        if not sent:
-            return []
-        parts.append(_AxisPart(src_axis, dst_axis, src_held, dst_held, sent))
-    return [
-        _box_runs(src_buffer, src_tensor, dst_buffer, dst_tensor, parts, box)
-        for box in itertools.product(*(p.sent for p in parts))
-    ]
-
-
-def _box_runs(
-    src_buffer: BufferDesc,
-    src_tensor: Tensor,
-    dst_buffer: BufferDesc,
-    dst_tensor: Tensor,
-    parts: Sequence[_AxisPart],
-    box: Sequence[Progression],
-) -> tuple[np.ndarray, np.ndarray, int]:
-    """The runs of one box of indices, ``box[i]`` the indices of axis ``parts[i]``: a loop per
-    axis of more than one index, the loops whose steps continue the run on both sides folded into
-    one run."""
-    src_base = src_buffer.slot_offset + src_tensor.offset
-    dst_base = dst_buffer.slot_offset + dst_tensor.offset
-    loops = []  # (count, source step, destination step) in bytes
-    for part, indices in zip(parts, box):
-        src_base += (
-            (indices.start - part.src_held.start) // part.src_held.step * part.src_axis.stride
-        )
-        dst_base += (
-            (indices.start - part.dst_held.start) // part.dst_held.step * part.dst_axis.stride
-        )
-        if indices.count > 1:
-            loops.append(
-                (
-                    indices.count,
-                    indices.step // part.src_held.step * part.src_axis.stride,
-                    indices.step // part.dst_held.step * part.dst_axis.stride,
-                )
-            )
-    size = 1
-    while True:
-        for i, (count, src_step, dst_step) in enumerate(loops):
-            if src_step == size and dst_step == size:
-                size *= count
-                del loops[i]
-                break
-        else:
-            break
-    src_offsets = np.array([src_base], dtype=np.int64)
-    dst_offsets = np.array([dst_base], dtype=np.int64)
-    # Outermost destination loop first, so runs come in destination order.
-    for count, src_step, dst_step in sorted(loops, key=lambda loop: -loop[2]):
-        index = np.arange(count, dtype=np.int64)
-        src_offsets = (src_offsets[:, None] + index[None, :] * src_step).ravel()
-        dst_offsets = (dst_offsets[:, None] + index[None, :] * dst_step).ravel()
-    return src_offsets, dst_offsets, size
+    if me not in places:
+        return None
+    # The elected holder of each stretch: the one at ``key`` modulo their count, in place order.
+    order = np.cumsum(holders, axis=0) - 1
+    elected = np.argmax(holders & (order == pairing.key % np.maximum(count, 1)), axis=0)
+    mine = elected == places.index(me)
+    if not mine.any():
+        return None
+    k = cover[places.index(me), mine]
+    at, offset, _ = held[places.index(me)]
+    lo, hi, into = lo[mine], hi[mine], into[mine]
+    return offset[k] + lo - at[k], want[1][into] + lo - want[0][into], hi - lo
 
 
 def merge_runs(
@@ -483,15 +363,10 @@ def merge_runs(
     return src_offsets[first], dst_offsets[first], merged
 
 
-def _pinned(tensor: Tensor) -> Tensor:
-    """The tensor with its axis of token positions narrowed to index 0, so that its runs are those
-    of one position."""
-    if tensor.positional is None:
-        return tensor
-    axes = tuple(
-        Axis.unchecked(a.name, 1, a.stride) if a.kind.positional else a for a in tensor.axes
-    )
-    return Tensor.unchecked(axes, tensor.offset, tensor.name, tensor.dtype)
+def _space(layout: PageLayout, buffer: BufferDesc) -> tuple:
+    """What the coordinates of the buffer's space mean on the rank of ``layout``
+    (``RoleLayout.space``)."""
+    return buffer.layout.space(buffer.size, grid_place(layout.topology, buffer.layout.split)[0])
 
 
 def _position_rule(
@@ -501,43 +376,40 @@ def _position_rule(
     dst_buffer: BufferDesc,
     groups: tuple[dict[tuple[int, int], int], dict[tuple[int, int], int]],
 ) -> PositionRule | None:
-    """How a buffer both ranks transfer moves with token position, or None when it holds no axis
-    of token positions; ``groups`` are both layouts' ``layer_group_of``.
+    """How a buffer both ranks transfer moves with token position, or None when it holds no token
+    positions; ``groups`` are both layouts' ``layer_group_of``.
 
     Raises:
-        ValueError: If one side's buffer has an axis of token positions and the other's has none,
-            the axes differ in name or kind, or the axis lies in a layer group holding one slot
-            per request.
+        ValueError: If one side's buffer holds token positions and the other's does not, or such a
+            buffer lies in a layer group holding one slot per request.
     """
-    src_axis, dst_axis = src_buffer.positional, dst_buffer.positional
-    if src_axis is None and dst_axis is None:
+    if not src_buffer.positional and not dst_buffer.positional:
         return None
     where = f"buffer ({src_buffer.layer}, {src_buffer.role})"
-    if (
-        src_axis is None
-        or dst_axis is None
-        or src_axis.name != dst_axis.name
-        or type(src_axis.kind) is not type(dst_axis.kind)
-    ):
-        raise ValueError(
-            f"{where}: token positions {src_axis and (src_axis.name, src_axis.kind.name)!r} "
-            f"against {dst_axis and (dst_axis.name, dst_axis.kind.name)!r}"
-        )
+    if src_buffer.positional != dst_buffer.positional:
+        names = [b.layout.name if b.positional else None for b in (src_buffer, dst_buffer)]
+        raise ValueError(f"{where}: token positions of {names[0]!r} against {names[1]!r}")
     for page, buffer, group_of in ((src, src_buffer, groups[0]), (dst, dst_buffer, groups[1])):
         group = page.layer_groups[group_of[buffer.pool_group, buffer.layer]]
         if group.kind.per_request:
             raise ValueError(
-                f"{where}: a {src_axis.kind.name} of token positions in a {group.kind} layer "
+                f"{where}: a {buffer.layout.name} of token positions in a {group.kind} layer "
                 "group, which holds one slot per request"
             )
-    return PositionRule(src_axis, dst_axis, src.tokens_per_page)
+    return PositionRule(
+        src_buffer.layout,
+        dst_buffer.layout,
+        src_buffer.layout.stride(src_buffer.size),
+        dst_buffer.layout.stride(dst_buffer.size),
+        src.tokens_per_page,
+    )
 
 
 def map_buffers(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> list[BufferRuns]:
     """What the rank of ``src`` sends the rank of ``dst``: for each buffer both transfer (same
-    global layer and role), the runs of its tensors the source is the elected sender of. Buffers
-    it sends nothing of are left out. A buffer of token positions gives the runs of one position,
-    which ``page_runs`` moves to each position of a page.
+    global layer and role), the runs of the bytes of its space the source is the elected sender
+    of. Buffers it sends nothing of are left out. A buffer of token positions gives the runs of
+    one position, which ``page_runs`` moves to each position of a page.
 
     Example: K of one layer, 8 heads of 256 bytes head-major, from TP2 rank 0 to TP4 rank 1: one
     ``BufferRuns`` of a single run, 512 bytes from byte ``s + 512`` of the source's slot to byte
@@ -550,10 +422,10 @@ def map_buffers(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> 
             data-parallel rank by default.
 
     Raises:
-        ValueError: If two matched buffers' tensors or axes differ in name, or in extent other
-            than an axis of token positions', one has an axis of token positions the other has
-            not, such an axis lies in a group holding one slot per request, or the destination
-            holds an index no source rank it pairs with holds.
+        ValueError: If two matched buffers lay out different spaces (``RoleLayout.space``), one
+            holds token positions and the other does not, such a buffer lies in a group holding
+            one slot per request, or the destination holds a byte no source rank it pairs with
+            holds.
     """
     pairing = Pairing.between(
         src.topology, dst.topology, dst.topology.dp_rank if key is None else key
@@ -565,32 +437,21 @@ def map_buffers(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> 
         dst_buffer = dst_buffers.get((src_buffer.layer, src_buffer.role))
         if dst_buffer is None or not src_buffer.transferred:
             continue
-        dst_tensors = {t.name: t for t in dst_buffer.tensors}
-        if set(dst_tensors) != {t.name for t in src_buffer.tensors}:
-            raise ValueError(
-                f"buffer ({src_buffer.layer}, {src_buffer.role}): tensors "
-                f"{[t.name for t in src_buffer.tensors]} against {list(dst_tensors)}"
-            )
         rule = _position_rule(src, src_buffer, dst, dst_buffer, groups)
-        parts = [
-            part
-            for src_tensor in src_buffer.tensors
-            for part in _tensor_runs(
-                src_buffer,
-                _pinned(src_tensor),
-                dst_buffer,
-                _pinned(dst_tensors[src_tensor.name]),
-                pairing,
-                dst.topology,
+        spaces = _space(src, src_buffer), _space(dst, dst_buffer)
+        if spaces[0] != spaces[1]:
+            raise ValueError(
+                f"buffer ({src_buffer.layer}, {src_buffer.role}): space {spaces[0]} against "
+                f"{spaces[1]}"
             )
-        ]
-        if not parts:
+        runs = _layout_runs(src_buffer, dst_buffer, pairing, dst.topology)
+        if runs is None:
             continue
-        src_offsets = np.concatenate([p[0] for p in parts])
-        dst_offsets = np.concatenate([p[1] for p in parts])
-        sizes = np.concatenate([np.full(p[0].size, p[2], dtype=np.int64) for p in parts])
-        runs = merge_runs(src_offsets, dst_offsets, sizes)
-        out.append(BufferRuns(src_buffer, dst_buffer, *runs, by_position=rule))
+        src_offsets, dst_offsets, sizes = runs
+        merged = merge_runs(
+            src_offsets + src_buffer.slot_offset, dst_offsets + dst_buffer.slot_offset, sizes
+        )
+        out.append(BufferRuns(src_buffer, dst_buffer, *merged, by_position=rule))
     return out
 
 
@@ -749,9 +610,9 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
     - On the layers both hold, a buffer one rank alone transfers, unless that rank rebuilds its
       role per request (``PageLayout.request_rebuilt_roles``: CSA2's generation workers rebuild
       the sliding caches a context-only worker keeps none of past its split); otherwise buffers
-      of other sub-pages, tensors, axes, extents, element types, layer-group kinds or model
-      layers. Axes correspond as their kinds judge (``AxisKind.corresponds``): heads split over
-      different rank counts do, and so may axes of token positions each side sizes as it keeps.
+      of other sub-pages, spaces (``RoleLayout.space``), element types, layer-group kinds or
+      model layers. Heads split over different rank counts lay out one space, and so may layouts
+      of token positions each side sizes as it keeps.
     - A model layer's role whose buffers the two name by other global layers, or that one rank
       alone transfers of a model layer both hold, which would move one layer's bytes into
       another's or leave it unwritten.
@@ -814,7 +675,7 @@ def _buffer_problems(a: PageLayout, b: PageLayout, groups) -> list[str]:
             continue
         if x.expansion != y.expansion:
             problems.append(f"buffer {key}: {x.expansion} sub-pages against {y.expansion}")
-        problems += _tensor_problems(key, x, y)
+        problems += _layout_problems(key, a, x, b, y)
         pair = _group_pair(a, x, b, y, groups)
         if pair is None:
             problems.append(f"buffer {key} lies in no layer group of one rank")
@@ -831,34 +692,18 @@ def _buffer_problems(a: PageLayout, b: PageLayout, groups) -> list[str]:
     return problems
 
 
-def _tensor_problems(key: tuple[int, str], x: BufferDesc, y: BufferDesc) -> list[str]:
-    """The differences of two ranks' tensors of one buffer: names, axes as their kinds judge
-    (``AxisKind.corresponds``), element types."""
+def _layout_problems(
+    key: tuple[int, str], a: PageLayout, x: BufferDesc, b: PageLayout, y: BufferDesc
+) -> list[str]:
+    """The differences of two ranks' layouts of one buffer: the spaces they lay out
+    (``RoleLayout.space``) and the elements' types."""
     problems = []
-    xs, ys = {t.name: t for t in x.tensors}, {t.name: t for t in y.tensors}
-    if set(xs) != set(ys):
-        problems.append(f"buffer {key}: tensors {sorted(xs)} against {sorted(ys)}")
-    for name in sorted(set(xs) & set(ys)):
-        tx, ty = xs[name], ys[name]
-        ax, ay = {a.name: a for a in tx.axes}, {a.name: a for a in ty.axes}
-        if set(ax) != set(ay) or not all(
-            ax[n].kind.corresponds(ax[n], ay[n]) and ay[n].kind.corresponds(ay[n], ax[n])
-            for n in ax
-        ):
-            problems.append(
-                f"buffer {key} tensor {name!r}: axes {_axes_summary(tx)} against "
-                f"{_axes_summary(ty)}"
-            )
-        if tx.dtype != ty.dtype:
-            problems.append(
-                f"buffer {key} tensor {name!r}: elements of type {tx.dtype} against {ty.dtype}"
-            )
+    space_x, space_y = _space(a, x), _space(b, y)
+    if space_x != space_y:
+        problems.append(f"buffer {key}: space {space_x} against {space_y}")
+    if x.layout.dtype != y.layout.dtype:
+        problems.append(f"buffer {key}: elements of type {x.layout.dtype} against {y.layout.dtype}")
     return problems
-
-
-def _axes_summary(tensor: Tensor) -> dict[str, object]:
-    """Each axis' extent by name, or its kind's name for an axis of token positions."""
-    return {a.name: a.kind.name if a.kind.positional else a.extent for a in tensor.axes}
 
 
 def _pages_pair(a: PageLayout, b: PageLayout, groups) -> bool:

@@ -25,7 +25,13 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import ShardDesc, head_major, replicated
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+    ByHead,
+    Own,
+    Replicated,
+    Sectioned,
+    ShardDesc,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     MemoryKind,
     StagingOptions,
@@ -138,32 +144,29 @@ def kinds(layout):
 
 
 def mapper_of(b):
-    """How a buffer's tensors spread over ranks: "REPLICATED" alike on every rank, "SECTIONED" split
-    by byte, else "NHD" or "INDEXED" by where its head axis lies."""
+    """How a buffer's layout spreads it over ranks: "REPLICATED" alike on every rank, "SECTIONED"
+    split by byte, else "NHD" or "INDEXED" by whether its tokens or its heads are outermost."""
     if not b.split:
         return "REPLICATED"
-    (tensor, *rest) = b.tensors
-    names = [a.name for a in tensor.axes]
-    if "shard" in names:
+    if isinstance(b.layout, Own):
         return "INDEXED"  # a rank's own bytes, its heads undeclared
-    if rest or "head" not in names:
+    if isinstance(b.layout, Sectioned):
         return "SECTIONED"
-    return "NHD" if names[0] == "token" else "INDEXED"
+    return "NHD" if b.layout.token_major else "INDEXED"
 
 
 def sections_of(b):
     """A sectioned buffer's section sizes on this rank; None otherwise."""
     if mapper_of(b) != "SECTIONED":
         return None
-    return tuple(t.axes[0].held for t in b.tensors)
+    return b.layout.section_bytes
 
 
 def head_bytes_of(b):
     """Bytes of one head on this rank of a buffer split by head; None otherwise."""
-    head = next((a for a in b.tensors[0].axes if a.name == "head"), None)
-    if mapper_of(b) not in ("INDEXED", "NHD") or head is None:
+    if not isinstance(b.layout, ByHead):
         return None
-    return b.size // head.held
+    return b.layout.head_bytes
 
 
 def roles(layout):
@@ -495,13 +498,13 @@ def lies(layout):
         )
 
     other = (
-        head_major(first.size, 1, 1) if mapper_of(first) == "REPLICATED" else replicated(first.size)
+        ByHead(head_bytes=first.size, total=1) if mapper_of(first) == "REPLICATED" else Replicated()
     )
     window = 128 if layout.layer_groups[0].kept_window == 64 else 64
     out = {
         "offset": dict(buffers=buffers(slot_offset=first.slot_offset + first.size)),
         "layer": dict(buffers=buffers(layer=first.layer + 1000)),
-        "mapper": dict(buffers=buffers(tensors=other)),
+        "mapper": dict(buffers=buffers(layout=other)),
         "extra buffer": dict(
             buffers=layout.buffers + (dataclasses.replace(first, layer=first.layer + 1000),)
         ),

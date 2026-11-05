@@ -274,7 +274,7 @@ def test_transfer_views_do_not_depend_on_the_kv_head_split(dtype: DataType) -> N
             # How each side buffer spreads over ranks, as the page table declares it.
             global_of = {lid: ids[0] for lid, ids in layer_ids_of(cm).items()}
             described = {
-                (b.layer, b.role): b.tensors for b in cm.get_page_table().page_layout.buffers
+                (b.layer, b.role): b.layout for b in cm.get_page_table().page_layout.buffers
             }
             tensors = {
                 (layer, role): described[(global_of[cm.layer_offsets[layer]], role)]

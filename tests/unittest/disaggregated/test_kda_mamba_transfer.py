@@ -222,12 +222,12 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
         assert ssm_buffer.size == SSM_SLOT_BYTES
 
         # qwen3_next 3-sectioning: equal sections summing to the conv slot.
-        sections = [t.axes[0].held for t in conv_buffer.tensors]
+        sections = list(conv_buffer.layout.section_bytes)
         assert sections == [CONV_SLOT_BYTES // 3] * 3
         assert sum(sections) == conv_buffer.size
-        (head,) = (a for a in ssm_buffer.tensors[0].axes if a.name == "head")
-        assert ssm_buffer.size // head.held == KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
-        assert head.held == KDA_NUM_HEADS
+        head_bytes = ssm_buffer.layout.head_bytes
+        assert head_bytes == KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
+        assert ssm_buffer.size // head_bytes == KDA_NUM_HEADS
 
         # The state group holds exactly the KDA layers (by global layer id).
         assert sorted(pt.page_layout.layer_groups[state].layers) == [
@@ -315,11 +315,11 @@ def _synthetic_kda_layout(tp: int, adp: bool, denom: int, layer_ids=None):
     """
     from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
         BufferDesc,
+        ByHead,
         LayerGroupDesc,
         PageLayout,
         RankTopology,
-        head_major,
-        sectioned,
+        Sectioned,
     )
 
     if layer_ids is None:
@@ -332,7 +332,7 @@ def _synthetic_kda_layout(tp: int, adp: bool, denom: int, layer_ids=None):
     buffers = []
     for i, layer in enumerate(layer_ids):
         buffers.append(
-            BufferDesc(layer, "conv_state", 0, 0, i * conv, conv, sectioned([conv // 3] * 3, ranks))
+            BufferDesc(layer, "conv_state", 0, 0, i * conv, conv, Sectioned((conv // 3,) * 3))
         )
         buffers.append(
             BufferDesc(
@@ -342,7 +342,7 @@ def _synthetic_kda_layout(tp: int, adp: bool, denom: int, layer_ids=None):
                 1,
                 i * ssm,
                 ssm,
-                head_major(ssm, ssm // head, ssm // head * ranks, ("tp", "cp")),
+                ByHead(head_bytes=head, total=ssm // head * ranks, split=("tp", "cp")),
             )
         )
     return PageLayout(

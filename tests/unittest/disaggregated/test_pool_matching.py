@@ -29,11 +29,11 @@ from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
+    ByHead,
     LayerGroupDesc,
     PageLayout,
     RankTopology,
-    head_major,
-    replicated,
+    Replicated,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -44,13 +44,15 @@ HEAD_BYTES = 64
 def kv(heads=2, total=2, pool=0):
     """K and V of ``heads`` heads of ``total``, in pool ``pool`` of their layer group."""
     size = heads * HEAD_BYTES
-    return [(role, pool, size, head_major(size, heads, total)) for role in ("key", "value")]
+    return [
+        (role, pool, size, ByHead(head_bytes=HEAD_BYTES, total=total)) for role in ("key", "value")
+    ]
 
 
 def page_table(groups, topology=RankTopology()):
     """A native page table of ``groups``.
 
-    Per layer group (kind, pool group, layers, roles), each role (name, pool, size, tensors) lies
+    Per layer group (kind, pool group, layers, roles), each role (name, pool, size, layout) lies
     layer after layer within its pool's slot.
     """
     ends = defaultdict(int)
@@ -58,8 +60,8 @@ def page_table(groups, topology=RankTopology()):
     for kind, g, layers, roles in groups:
         descs.append(LayerGroupDesc(kind, None, 0, g, tuple(layers)))
         for layer in layers:
-            for role, pool, size, tensors in roles:
-                buffers.append(BufferDesc(layer, role, g, pool, ends[g, pool], size, tensors))
+            for role, pool, size, role_layout in roles:
+                buffers.append(BufferDesc(layer, role, g, pool, ends[g, pool], size, role_layout))
                 ends[g, pool] += size
     widths = defaultdict(dict)
     for (g, pool), width in ends.items():
@@ -112,7 +114,9 @@ def test_a_pool_pairs_with_the_peer_pool_its_buffers_land_in():
 
     They do even where the peer orders the two pools the other way round.
     """
-    scales = [(f"{role}_block_scale", 1, 16, head_major(16, 2, 2)) for role in ("key", "value")]
+    scales = [
+        (f"{role}_block_scale", 1, 16, ByHead(head_bytes=8, total=2)) for role in ("key", "value")
+    ]
     peer_scales = [(role, 0, size, t) for role, _, size, t in scales]
     own = rank("ctx", page_table([("attention", 0, (0, 1), kv() + scales)]))
     peer = rank("gen", page_table([("attention", 0, (0, 1), kv(pool=1) + peer_scales)]))
@@ -121,7 +125,7 @@ def test_a_pool_pairs_with_the_peer_pool_its_buffers_land_in():
 
 def test_a_replicated_index_cache_is_sent_by_one_of_the_ranks_fanning_in():
     """TP2 into TP1: both ranks send their K/V heads, one the index-K every rank holds alike."""
-    index = [("index_key", 1, 32, replicated(32))]
+    index = [("index_key", 1, 32, Replicated())]
     peer = rank("gen", page_table([("attention", 0, (0, 1), kv(4, 4) + index)]))
     sent = [
         kv_maps(
@@ -158,7 +162,7 @@ def test_a_layer_group_pairs_with_every_peer_group_holding_its_layers():
 
 
 def test_buffers_a_transfer_leaves_out_move_nothing():
-    index = [("index_key", 1, 32, replicated(32))]
+    index = [("index_key", 1, 32, Replicated())]
     own = rank("ctx", page_table([("attention", 0, (0, 1), kv() + index)]))
     peer = rank("gen", page_table([("attention", 0, (0, 1), kv() + index)]))
     excluded = frozenset({(1, "key"), (1, "value"), (0, "index_key"), (1, "index_key")})

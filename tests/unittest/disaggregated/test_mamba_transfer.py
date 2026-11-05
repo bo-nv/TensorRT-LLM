@@ -303,25 +303,24 @@ def _state_layout(*, side_bytes=128):
     """
     from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
         BufferDesc,
+        ByHead,
         LayerGroupDesc,
         PageLayout,
-        head_major,
-        replicated,
-        sectioned,
+        Replicated,
+        Sectioned,
     )
 
     conv, ssm = 1024, 2048
     buffers = []
     for i, layer in enumerate((1, 2)):
         buffers.append(
-            BufferDesc(layer, "conv_state", 1, 0, i * conv, conv, sectioned([512, 256, 256], 1))
+            BufferDesc(layer, "conv_state", 1, 0, i * conv, conv, Sectioned((512, 256, 256)))
         )
-        buffers.append(BufferDesc(layer, "ssm_state", 1, 1, i * ssm, ssm, head_major(ssm, 32, 32)))
+        ssm_layout = ByHead(head_bytes=ssm // 32, total=32)
+        buffers.append(BufferDesc(layer, "ssm_state", 1, 1, i * ssm, ssm, ssm_layout))
     widths = [2 * conv, 2 * ssm]
     if side_bytes is not None:
-        buffers.append(
-            BufferDesc(2, "ple_ngram_context", 1, 2, 0, side_bytes, replicated(side_bytes))
-        )
+        buffers.append(BufferDesc(2, "ple_ngram_context", 1, 2, 0, side_bytes, Replicated()))
         widths.append(side_bytes)
     return PageLayout(
         tokens_per_page=8,

@@ -51,11 +51,10 @@ from tensorrt_llm._torch.disaggregation.resource.utils import slot_pointers
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
+    ByHead,
     LayerGroupDesc,
     PageLayout,
-    head_major,
-    replicated,
-    token_major,
+    Replicated,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ManagerLayout
 
@@ -433,13 +432,13 @@ def _coalesced_page_table() -> ManagerLayout:
     K/V with a non-uniform layer stride and a replicated index-K in one pool.
     """
     u = _UNIT
-    kv = token_major(u, 16, 1, 1)
+    kv = ByHead(True, u, 1, 16)
     buffers = [
         BufferDesc(0, "key", 0, 0, 0 * u, u, kv),
         BufferDesc(0, "value", 0, 0, 1 * u, u, kv),
         BufferDesc(1, "key", 0, 0, 2 * u, u, kv),
         BufferDesc(1, "value", 0, 0, 3 * u, u, kv),
-        BufferDesc(1, "index_key", 0, 0, 4 * u, u, replicated(u)),
+        BufferDesc(1, "index_key", 0, 0, 4 * u, u, Replicated()),
         BufferDesc(2, "key", 0, 0, 5 * u, u, kv),
         BufferDesc(2, "value", 0, 0, 6 * u, u, kv),
         BufferDesc(3, "key", 0, 0, 7 * u, u, kv),
@@ -461,9 +460,9 @@ def _ignored_role_page_table() -> ManagerLayout:
     """
     u = _UNIT
     buffers = [
-        BufferDesc(0, "key", 0, 0, 0 * u, u, head_major(u, 1, 1)),
+        BufferDesc(0, "key", 0, 0, 0 * u, u, ByHead(head_bytes=u, total=1)),
         BufferDesc(0, "local", 0, 0, 1 * u, u, transferred=False),
-        BufferDesc(1, "key", 0, 0, 2 * u, u, head_major(u, 1, 1)),
+        BufferDesc(1, "key", 0, 0, 2 * u, u, ByHead(head_bytes=u, total=1)),
         BufferDesc(1, "local", 0, 0, 3 * u, u, transferred=False),
     ]
     return _attention_page_table(buffers, 4)

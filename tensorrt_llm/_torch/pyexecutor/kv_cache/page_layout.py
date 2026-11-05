@@ -15,63 +15,55 @@
 """One rank's page layout as immutable values, and which ranks of an instance hold the same bytes;
 standard library only.
 
-A buffer holds the local pieces of one or more tensors. A tensor names its axes and their extents
-over all ranks together; each axis has a byte stride between the indices a rank holds and a kind
-(``AxisKind``) saying which indices each rank holds:
+A buffer's layout (``RoleLayout``) says how its role's bytes spread over ranks. The buffers of one
+layer and role on all ranks together hold one space of bytes, of which each rank's buffer holds
+pieces (``RoleLayout.pieces``):
 
-    Axis("head", 8, 256, Contiguous(("tp",), 4))   # 8 heads of 256 B; TP rank r holds 4r..4r+3
-    Axis("row", 12, 64, Cyclic(("tp",)))           # TP rank r of n holds rows r, r + n, ...
-    Axis("byte", 256, 1)                           # every rank holds all 256 bytes (Whole)
+    ByHead(head_bytes=256, total=8)  # 8 heads of 256 B; TP2 rank 1 holds heads 4..7, bytes 1024..
+    Sectioned((32, 16, 16))          # [x | B | C], each section split by byte over the ranks
+    Replicated()                     # the whole buffer alike on every rank
 
-How two ranks' pages correspond is derived from these alone (``layout_mapping``), so a new kind is
-a class here saying which indices a rank holds, or which token positions a page holds and where;
-a layer group's kind (``GroupKind``) says how it addresses a request's pages."""
+How two ranks' pages correspond is derived from the pieces alone (``layout_mapping``), so a new way
+of laying a role out is one ``RoleLayout`` subclass saying which pieces a rank holds; a layer
+group's kind (``GroupKind``) says how it addresses a request's pages."""
 
 from __future__ import annotations
 
 import collections.abc
 import dataclasses
-import math
 import numbers
 import types
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import ClassVar, Literal, Mapping
+from typing import TYPE_CHECKING, ClassVar, Literal, Mapping
+
+if TYPE_CHECKING:
+    from .page_table import BufferSite
 
 __all__ = [
     "GRID_DIMENSIONS",
-    "Axis",
-    "AxisKind",
     "BufferDesc",
-    "Contiguous",
-    "Cyclic",
+    "ByHead",
     "GroupKind",
     "LayerGroupDesc",
+    "Own",
     "PageLayout",
     "Paged",
     "PerRequest",
-    "Progression",
+    "Piece",
     "RankTopology",
+    "Replicated",
+    "RoleLayout",
+    "Sectioned",
     "ShardDesc",
-    "Tensor",
-    "Whole",
-    "axis_document",
-    "axis_from_dict",
-    "axis_kind_from_dict",
-    "axis_to_dict",
+    "check_pieces",
     "content_shard",
     "grid_place",
     "group_kind",
-    "head_major",
-    "held",
-    "held_bytes",
     "layout_from_dict",
     "layout_to_dict",
-    "owned",
     "replica_ranks",
-    "replicated",
-    "sectioned",
-    "token_major",
+    "role_layout_from_dict",
 ]
 
 _QUANT_MODES = ("fp8", "nvfp4", "fp8_ds_mla")
@@ -92,60 +84,9 @@ def _frozen(mapping: dict) -> Mapping:
 _NO_ENTRIES: Mapping = _frozen({})
 
 GRID_DIMENSIONS = ("tp", "cp")
-"""Parallel dimensions an axis may split over (``Axis.split``): "tp" the tensor-parallel ranks of
+"""Parallel dimensions a layout may split over (``RoleLayout.split``): "tp" the tensor-parallel ranks of
 one attention data-parallel group, "cp" the context-parallel ranks. Pipeline ranks hold other
 layers and data-parallel ranks other requests, so neither splits a page."""
-
-
-@dataclass(frozen=True)
-class Progression:
-    """The indices ``start, start + step, ..., start + (count - 1) * step``.
-
-    Attributes:
-        start: First index.
-        step: Positive distance between consecutive indices.
-        count: Non-negative number of indices.
-    """
-
-    start: int
-    step: int
-    count: int
-
-    @property
-    def last(self) -> int:
-        """The last index; ``start - step`` when empty."""
-        return self.start + (self.count - 1) * self.step
-
-    def __len__(self) -> int:
-        return self.count
-
-    def __iter__(self):
-        return iter(range(self.start, self.start + self.count * self.step, self.step))
-
-    def __contains__(self, index: object) -> bool:
-        if not isinstance(index, int) or self.count == 0:
-            return False
-        offset = index - self.start
-        return 0 <= offset <= (self.count - 1) * self.step and offset % self.step == 0
-
-    def intersect(self, other: Progression) -> Progression | None:
-        """The indices both hold, themselves a progression, or None when they share none."""
-        if self.count == 0 or other.count == 0:
-            return None
-        lo, hi = max(self.start, other.start), min(self.last, other.last)
-        if lo > hi:
-            return None
-        g = math.gcd(self.step, other.step)
-        if (other.start - self.start) % g:
-            return None
-        lcm = self.step // g * other.step
-        # x = self.start + self.step * t with x = other.start (mod other.step).
-        m = other.step // g
-        t = 0 if m == 1 else (other.start - self.start) // g * pow(self.step // g, -1, m) % m
-        first = lo + (self.start + self.step * t - lo) % lcm
-        if first > hi:
-            return None
-        return Progression(first, lcm, (hi - first) // lcm + 1)
 
 
 def grid_place(topology: RankTopology, dims: Sequence[str]) -> tuple[int, int]:
@@ -164,7 +105,7 @@ def grid_place(topology: RankTopology, dims: Sequence[str]) -> tuple[int, int]:
     return size, rank
 
 
-_AXIS_KINDS: dict[str, type[AxisKind]] = {}
+_ROLE_LAYOUTS: dict[str, type[RoleLayout]] = {}
 
 
 def _register(registry: dict, cls: type, what: str) -> None:
@@ -202,27 +143,48 @@ def _sparse(kind: object) -> dict:
 
 
 @dataclass(frozen=True)
-class AxisKind:
-    """How the indices of an axis spread over ranks, or which token positions the axis holds.
-
-    A subclass is one such way, a frozen dataclass whose fields are its data, named (``name``)
-    for peers and for ``layout_id``. What moves between ranks is derived from what it says here
-    (``layout_mapping``), so a new kind is one class:
-
-    - A kind spreading indices over ranks gives ``split`` and ``indices``, and ``count`` when every
-      rank holds as many; ``Contiguous`` is one.
-    - A kind of token positions sets ``positional`` and gives ``positions`` and ``index_of``.
-
-    A subclass overriding none of these holds every index on every rank, as ``Whole``.
+class Piece:
+    """Bytes of a role's space that a rank's buffer holds: ``size`` bytes from coordinate ``at`` of
+    the space, at byte ``offset`` of the buffer.
 
     Attributes:
-        name: The kind's name, unique among axis kinds.
-        positional: Whether the axis indexes token positions, which a page holds according to the
-            positions it has written, rather than fixed indices.
+        at: Coordinate of the piece's first byte in the space of the role's buffers on all ranks.
+        offset: Byte offset of the piece within the buffer on this rank.
+        size: Positive number of bytes.
+    """
+
+    at: int
+    offset: int
+    size: int
+
+
+@dataclass(frozen=True)
+class RoleLayout:
+    """How the bytes of a role's buffers spread over ranks.
+
+    The buffers of one layer and role on all ranks together hold one space of bytes. A rank's
+    buffer holds pieces of it (``pieces``), by the rank's place among the ranks of the parallel
+    dimensions the layout splits over (``split``); a buffer every rank holds alike splits over
+    none. Two ranks' buffers correspond where their layouts lay out the same space (``space``):
+    each byte of it the destination holds comes from one of the source ranks holding it
+    (``layout_mapping``).
+
+    A subclass is one way of laying a role out, a frozen dataclass whose fields are its data,
+    named (``name``) for peers and for ``layout_id``. A new way is one subclass, here or in a
+    model's own module, giving ``pieces`` and ``space``; one of token positions (``positional``)
+    also gives ``positions``, ``index_of`` and ``stride``. A manager's spec
+    (``page_table.PageTableSpec``) names a layout per role; each buffer's is that layout resolved
+    from the buffer's facts (``resolve``).
+
+    Attributes:
+        name: The layout's name, unique among role layouts.
+        positional: Whether the buffer holds token positions, of which a page holds those it has
+            written: its pieces are then those of one position, which lies at the index its
+            position takes (``index_of``), ``stride`` bytes per index.
 
     Raises:
-        TypeError: On defining a positional kind that does not give ``positions`` and
-            ``index_of``.
+        TypeError: On defining a positional layout that does not give ``positions``,
+            ``index_of`` and ``stride``.
     """
 
     name: ClassVar[str] = ""
@@ -231,370 +193,338 @@ class AxisKind:
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)
         if cls.positional and (
-            cls.positions is AxisKind.positions or cls.index_of is AxisKind.index_of
+            cls.positions is RoleLayout.positions
+            or cls.index_of is RoleLayout.index_of
+            or cls.stride is RoleLayout.stride
         ):
             raise TypeError(
-                f"axis kind {cls.__name__} holds token positions but does not say which a page "
-                "holds (positions) or where (index_of)"
+                f"role layout {cls.__name__} holds token positions but does not say which a page "
+                "holds (positions), where (index_of) or how far apart (stride)"
             )
-        _register(_AXIS_KINDS, cls, "axis kind")
+        _register(_ROLE_LAYOUTS, cls, "role layout")
 
     @property
     def split(self) -> tuple[str, ...]:
-        """The parallel dimensions the axis spreads over, outer to inner; none by default."""
+        """The parallel dimensions the buffers spread over, outer to inner: none by default, every
+        rank holding the whole space."""
         return ()
 
-    def check(self, axis: Axis) -> None:
-        """Raise ValueError if ``axis`` cannot be of this kind."""
+    @property
+    def dtype(self) -> str | None:
+        """The type of the elements by name, such as ``"bfloat16"``, or None where the layout
+        states none; peers whose elements differ in type do not correspond."""
+        return None
 
-    def indices(self, axis: Axis, topology: RankTopology) -> Progression:
-        """The global indices of ``axis`` the rank at ``topology`` holds, in local order: all of
-        them by default."""
-        return Progression(0, 1, axis.extent)
+    def resolve(self, site: BufferSite) -> RoleLayout:
+        """The layout of one buffer, filling what a manager's spec leaves to each buffer from its
+        facts (``page_table.BufferSite``: its size, tokens, heads, and the dimensions its layer
+        group splits over): this layout itself by default."""
+        return self
 
-    def count(self, axis: Axis) -> int | None:
-        """How many indices of ``axis`` a rank holds, or None where that differs by rank."""
-        return axis.extent
+    def check(self, size: int) -> None:
+        """Raise ValueError if a buffer of ``size`` bytes cannot be laid out so."""
 
-    def positions(self, axis: Axis, page: int, end: int, tokens_per_page: int) -> range:
-        """For a positional kind: the token positions of page ``page`` (its position among a
-        request's pages, from 0, of ``tokens_per_page`` positions each) that ``axis`` holds once
+    def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
+        """The pieces of the space a buffer of ``size`` bytes holds at place ``rank`` of the
+        ``ranks`` ranks of its split (``grid_place``), lying back to back over the buffer
+        (``check_pieces``); for a positional layout, those of one token position."""
+        raise NotImplementedError(f"role layout {self.name!r} gives no pieces")
+
+    def space(self, size: int, ranks: int) -> tuple:
+        """What the coordinates of the space mean, for buffers of ``size`` bytes over ``ranks``
+        ranks: a name and the space's extents, equal on two ranks whose buffers correspond. A
+        layout laying out another's space, as in another order of its bytes, gives the other's."""
+        raise NotImplementedError(f"role layout {self.name!r} gives no space")
+
+    def even(self, ranks: int) -> bool:
+        """Whether pieces over ``ranks`` ranks name the same bytes under every rank count that
+        divides it or that it divides, so that ranks of those counts holding the same bytes may
+        share names (``content_shard``): yes by default."""
+        return True
+
+    def positions(self, page: int, end: int, tokens_per_page: int) -> range:
+        """For a positional layout: the token positions of page ``page`` (its position among a
+        request's pages, from 0, of ``tokens_per_page`` positions each) that the buffer holds once
         the request has written every position below ``end``."""
-        raise NotImplementedError(f"axis kind {self.name!r} holds no token positions")
+        raise NotImplementedError(f"role layout {self.name!r} holds no token positions")
 
-    def index_of(self, axis: Axis, positions, tokens_per_page: int):
-        """For a positional kind: the index of ``axis`` holding each of ``positions`` (an integer
-        or an integer array; the result is the same) in pages of ``tokens_per_page`` positions."""
-        raise NotImplementedError(f"axis kind {self.name!r} holds no token positions")
+    def index_of(self, positions, tokens_per_page: int):
+        """For a positional layout: the index holding each of ``positions`` (an integer or an
+        integer array; the result is the same) in pages of ``tokens_per_page`` positions."""
+        raise NotImplementedError(f"role layout {self.name!r} holds no token positions")
 
-    def corresponds(self, axis: Axis, peer: Axis) -> bool:
-        """Whether ``peer``, a peer's axis of the same name, can pair with ``axis``: by default
-        when it indexes no token positions and has the same extent, however it spreads."""
-        return not peer.kind.positional and peer.extent == axis.extent
-
-    def document(self) -> dict:
-        """What ``layout_id`` hashes of the kind besides the axis' name, extent and stride: by
-        default its name and its fields not at their defaults."""
-        return {"kind": self.name, **_sparse(self)}
+    def stride(self, size: int) -> int:
+        """For a positional layout: the bytes between consecutive indices of a buffer of ``size``
+        bytes."""
+        raise NotImplementedError(f"role layout {self.name!r} holds no token positions")
 
     def to_dict(self) -> dict:
-        """The kind as plain values for a peer, which ``axis_kind_from_dict`` reads back."""
+        """The layout as plain values for a peer, which ``role_layout_from_dict`` reads back."""
         return {"name": self.name, **_sparse(self)}
 
-
-def axis_kind_from_dict(data: Mapping) -> AxisKind:
-    """The axis kind ``AxisKind.to_dict`` wrote, checked as its constructor checks it."""
-    fields = dict(data)
-    name = fields.pop("name")
-    if name not in _AXIS_KINDS:
-        raise ValueError(f"unknown axis kind {name!r}; known: {sorted(_AXIS_KINDS)}")
-    return _AXIS_KINDS[name](**fields)
-
-
-@dataclass(frozen=True)
-class Whole(AxisKind):
-    """Every rank holds every index: ``Axis("byte", 256, 1)`` is 256 bytes alike on every rank."""
-
-    name: ClassVar[str] = "whole"
-
     def document(self) -> dict:
-        return {}
+        """What ``layout_id`` hashes of the layout: its name and its fields not at their defaults,
+        but the element type."""
+        fields = _sparse(self)
+        fields.pop("dtype", None)
+        return {"layout": self.name, **fields}
 
 
-@dataclass(frozen=True)
-class Contiguous(AxisKind):
-    """Rank ``r`` of ``n`` in the grid of the ``split`` dimensions holds ``held`` indices from
-    ``r * extent // n``.
-
-    8 heads over TP2, ``Contiguous(("tp",), 4)``: rank 0 holds heads 0..3, rank 1 heads 4..7.
-    6 heads over TP4, ``Contiguous(("tp",), 2)``: ranks hold 0..1, 1..2, 3..4 and 4..5; ranks
-    hold overlapping runs where ``held * n`` exceeds the extent.
-
-    Attributes:
-        split: Parallel dimensions from ``GRID_DIMENSIONS``, outer to inner, at least one; the
-            tensor-parallel ranks by default. Normalized to a tuple.
-        held: Positive number of indices a rank holds, at most the axis' extent.
+def role_layout_from_dict(data: Mapping) -> RoleLayout:
+    """The role layout ``RoleLayout.to_dict`` wrote, checked as its constructor checks it.
 
     Raises:
-        ValueError: If split is empty or names a dimension twice or one outside
-            ``GRID_DIMENSIONS``, or held is not a positive integer.
+        ValueError: If it names no registered layout.
     """
+    fields = dict(data)
+    name = fields.pop("name", None)
+    if name not in _ROLE_LAYOUTS:
+        raise ValueError(f"unknown role layout {name!r}; known: {sorted(_ROLE_LAYOUTS)}")
+    return _ROLE_LAYOUTS[name](**fields)
 
-    name: ClassVar[str] = "contiguous"
-    split: tuple[str, ...] = ("tp",)
-    held: int = 1
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "split", _split(self.split, "a contiguous axis"))
-        object.__setattr__(self, "held", _integer(self.held, "indices held", 1))
-
-    def check(self, axis: Axis) -> None:
-        if self.held > axis.extent:
-            raise ValueError(f"axis {axis.name}: {self.held} held of {axis.extent} indices")
-
-    def indices(self, axis: Axis, topology: RankTopology) -> Progression:
-        n, r = grid_place(topology, self.split)
-        start = r * axis.extent // n
-        if start + self.held > axis.extent:
-            raise ValueError(
-                f"axis {axis.name}: rank {r} of {n} holds {self.held} indices from {start}, past "
-                f"its extent of {axis.extent}"
-            )
-        return Progression(start, 1, self.held)
-
-    def count(self, axis: Axis) -> int | None:
-        return self.held
-
-    def document(self) -> dict:
-        return {"split": list(self.split), "held": self.held}
+def _dtype(layout: RoleLayout) -> None:
+    if layout.dtype is not None:
+        object.__setattr__(layout, "dtype", str(layout.dtype))
 
 
 @dataclass(frozen=True)
-class Cyclic(AxisKind):
-    """Rank ``r`` of ``n`` in the grid of the ``split`` dimensions holds indices ``r, r + n, ...``
-    below the extent: 12 rows over TP4, rank 1 holds rows 1, 5 and 9.
+class Replicated(RoleLayout):
+    """The whole buffer alike on every rank, as an index-K cache is."""
+
+    name: ClassVar[str] = "replicated"
+
+    def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
+        return (Piece(0, 0, size),)
+
+    def space(self, size: int, ranks: int) -> tuple:
+        return ("replicated", size)
+
+
+@dataclass(frozen=True)
+class Own(RoleLayout):
+    """Each rank's own share among the ranks of ``split``, which pairs only with the same rank's:
+    the layout of a buffer whose split the manager does not describe further, or that never moves.
 
     Attributes:
-        split: Parallel dimensions from ``GRID_DIMENSIONS``, outer to inner, at least one; the
-            tensor-parallel ranks by default. Normalized to a tuple.
+        split: Parallel dimensions from ``GRID_DIMENSIONS``, outer to inner; the tensor-parallel
+            ranks by default, those of the buffer's layer group once resolved. Normalized to a
+            tuple.
 
     Raises:
         ValueError: If split is empty or names a dimension twice or one outside
             ``GRID_DIMENSIONS``.
     """
 
-    name: ClassVar[str] = "cyclic"
+    name: ClassVar[str] = "own"
     split: tuple[str, ...] = ("tp",)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "split", _split(self.split, "a cyclic axis"))
+        object.__setattr__(self, "split", _split(self.split, "an owned layout"))
 
-    def indices(self, axis: Axis, topology: RankTopology) -> Progression:
-        n, r = grid_place(topology, self.split)
-        return Progression(r, n, len(range(r, axis.extent, n)))
+    def resolve(self, site: BufferSite) -> RoleLayout:
+        return dataclasses.replace(self, split=site.split)
 
-    def count(self, axis: Axis) -> int | None:
-        return None
+    def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
+        return (Piece(rank * size, 0, size),)
 
-    def document(self) -> dict:
-        return {"split": list(self.split), "cyclic": True}
-
-
-@dataclass(frozen=True)
-class Axis:
-    """One dimension of a tensor: its extent over all ranks together, the byte stride between
-    consecutive indices a rank holds, and its kind, which says which of its indices a rank holds
-    (``held``). Local index ``k`` (the k-th index held, in order) lies at byte ``k * stride`` of
-    its tensor: with ``Axis("head", 8, 256, Contiguous(("tp",), 4))``, TP rank 1 holds heads
-    4..7, head 5 at byte 256 of its piece.
-
-    Attributes:
-        name: The axis' name; peers match tensors' axes on it.
-        extent: Positive number of indices over all ranks together.
-        stride: Positive bytes between consecutive local indices.
-        kind: How the indices spread (``Whole``, ``Contiguous``, ``Cyclic`` or another
-            ``AxisKind``).
-
-    Raises:
-        ValueError: If extent or stride is not a positive integer or is a boolean, kind is no
-            ``AxisKind``, or the kind does not fit the axis (``AxisKind.check``).
-    """
-
-    name: str
-    extent: int
-    stride: int
-    kind: AxisKind = Whole()
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not self.name:
-            raise ValueError(f"an axis needs a name, got {self.name!r}")
-        object.__setattr__(self, "extent", _integer(self.extent, f"extent of {self.name}", 1))
-        object.__setattr__(self, "stride", _integer(self.stride, f"stride of {self.name}", 1))
-        if not isinstance(self.kind, AxisKind):
-            raise ValueError(f"axis {self.name}: kind must be an AxisKind, got {self.kind!r}")
-        self.kind.check(self)
-
-    @property
-    def split(self) -> tuple[str, ...]:
-        """The parallel dimensions the axis spreads over (``AxisKind.split``)."""
-        return self.kind.split
-
-    @classmethod
-    def unchecked(cls, name: str, extent: int, stride: int, kind: AxisKind = Whole()) -> Axis:
-        """The constructor's axis of these values, without its checks and conversions; see
-        ``PageLayout.unchecked``."""
-        axis = object.__new__(cls)
-        axis.__dict__.update(name=name, extent=extent, stride=stride, kind=kind)
-        return axis
+    def space(self, size: int, ranks: int) -> tuple:
+        return ("own", size, ranks)
 
 
 @dataclass(frozen=True)
-class Tensor:
-    """A tensor whose local piece a buffer holds: its axes, and where the piece starts.
+class Sectioned(RoleLayout):
+    """Consecutive sections, each this rank's share of its own part of the space, split by byte
+    over the ranks of ``split``, as Mamba2's conv state ``[x | B | C]`` is: with sections of 32,
+    16 and 16 bytes on each of two ranks, rank 1 holds bytes 32..63, 80..95 and 112..127 of a
+    space of 64 + 32 + 32 bytes.
 
     Attributes:
-        axes: The tensor's axes, normalized to a tuple; their order is the order peers list them
-            in, not the order of their bytes, which their strides give.
-        offset: Non-negative byte offset of the local piece within its buffer.
-        name: Tells the tensors of one buffer apart; peers match tensors on it.
-        dtype: The type of the tensor's elements by name, such as ``"bfloat16"``, or None where
-            the layout states none; peers whose elements differ in type do not correspond
-            however their bytes line up.
+        section_bytes: Positive bytes of each section on this rank, in order; normalized to a
+            tuple.
+        split: Parallel dimensions from ``GRID_DIMENSIONS``, outer to inner; the tensor-parallel
+            ranks by default, those of the buffer's layer group once resolved. Normalized to a
+            tuple.
+        dtype: The type of the elements by name, or None.
 
     Raises:
-        ValueError: If there is no axis, two axes share a name, a parallel dimension splits two
-            axes, two axes index token positions, or offset is not a non-negative integer.
+        ValueError: If there is no section, a section is not a positive integer, or split is empty
+            or names a dimension twice or one outside ``GRID_DIMENSIONS``.
     """
 
-    axes: tuple[Axis, ...]
-    offset: int = 0
-    name: str = ""
+    name: ClassVar[str] = "sectioned"
+    section_bytes: tuple[int, ...]
+    split: tuple[str, ...] = ("tp",)
     dtype: str | None = None
 
     def __post_init__(self) -> None:
-        axes = tuple(self.axes)
-        if not axes or not all(isinstance(a, Axis) for a in axes):
-            raise ValueError(f"a tensor has one or more Axis values, got {axes!r}")
-        names = [a.name for a in axes]
-        if len(set(names)) != len(names):
-            raise ValueError(f"axis names repeat: {names}")
-        dims = [dim for a in axes for dim in a.split]
-        if len(set(dims)) != len(dims):
-            raise ValueError(f"a parallel dimension splits two axes: {dims}")
-        if sum(a.kind.positional for a in axes) > 1:
-            raise ValueError(f"axes {names}: more than one indexes token positions")
-        object.__setattr__(self, "axes", axes)
-        object.__setattr__(self, "offset", _integer(self.offset, "tensor offset"))
-        object.__setattr__(self, "name", str(self.name))
-        if self.dtype is not None:
-            object.__setattr__(self, "dtype", str(self.dtype))
+        sections = tuple(_integer(n, "section bytes", 1) for n in self.section_bytes)
+        if not sections:
+            raise ValueError("a sectioned layout has one or more sections")
+        object.__setattr__(self, "section_bytes", sections)
+        object.__setattr__(self, "split", _split(self.split, "a sectioned layout"))
+        _dtype(self)
 
-    @property
-    def split(self) -> bool:
-        """Whether some axis spreads over parallel dimensions."""
-        return any(a.split for a in self.axes)
+    def resolve(self, site: BufferSite) -> RoleLayout:
+        return dataclasses.replace(self, split=site.split)
 
-    @property
-    def positional(self) -> Axis | None:
-        """The tensor's axis of token positions (``AxisKind.positional``), or None."""
-        return next((a for a in self.axes if a.kind.positional), None)
-
-    @classmethod
-    def unchecked(
-        cls, axes: tuple[Axis, ...], offset: int = 0, name: str = "", dtype: str | None = None
-    ) -> Tensor:
-        """The constructor's tensor of these values, without its checks and conversions; see
-        ``PageLayout.unchecked``."""
-        tensor = object.__new__(cls)
-        tensor.__dict__.update(axes=tuple(axes), offset=offset, name=name, dtype=dtype)
-        return tensor
-
-
-def held(axis: Axis, topology: RankTopology) -> Progression:
-    """The global indices of ``axis`` that the rank at ``topology`` holds, in local order."""
-    return axis.kind.indices(axis, topology)
-
-
-def _footprint(tensor: Tensor) -> int | None:
-    """Bytes from its buffer's start to the end of a tensor's local piece, or None when an axis
-    leaves the count of its indices to the rank."""
-    end = tensor.offset + 1
-    for a in tensor.axes:
-        count = a.kind.count(a)
-        if count is None:
-            return None
-        end += (count - 1) * a.stride
-    return end
-
-
-def replicated(size: int) -> tuple[Tensor, ...]:
-    """A buffer of ``size`` bytes that every rank holds alike."""
-    return (Tensor((Axis("byte", size, 1),)),)
-
-
-def owned(size: int, ranks: int, split: Sequence[str] = ("tp",)) -> tuple[Tensor, ...]:
-    """A buffer of ``size`` bytes that is this rank's own share of ``ranks`` ranks along ``split``,
-    in a split the manager does not describe further: it corresponds only to the same rank's."""
-    return (
-        Tensor(
-            (Axis("shard", ranks, size, Contiguous(tuple(split), 1)), Axis("byte", size, 1)),
-            name="own",
-        ),
-    )
-
-
-def head_major(
-    size: int,
-    heads: int,
-    total_heads: int,
-    split: Sequence[str] = ("tp",),
-    *,
-    dtype: str | None = None,
-) -> tuple[Tensor, ...]:
-    """A buffer of ``heads`` heads of ``size // heads`` bytes each ([head, ...], HND), of
-    ``total_heads`` split contiguously over ``split``, of elements of type ``dtype``."""
-    if heads <= 0 or size % heads:
-        raise ValueError(f"{size} bytes is not a whole number of {heads} heads")
-    head = size // heads
-    return (
-        Tensor(
-            (
-                Axis("head", total_heads, head, Contiguous(tuple(split), heads)),
-                Axis("byte", head, 1),
-            ),
-            dtype=dtype,
-        ),
-    )
-
-
-def token_major(
-    size: int,
-    tokens: int,
-    heads: int,
-    total_heads: int,
-    split: Sequence[str] = ("tp",),
-    *,
-    dtype: str | None = None,
-) -> tuple[Tensor, ...]:
-    """A buffer of ``tokens`` tokens, each ``heads`` heads of equal bytes ([token, head, ...],
-    NHD), of ``total_heads`` split contiguously over ``split``, of elements of type ``dtype``."""
-    if tokens <= 0 or heads <= 0 or size % (tokens * heads):
-        raise ValueError(f"{size} bytes is not a whole number of {tokens} x {heads} token heads")
-    head = size // (tokens * heads)
-    return (
-        Tensor(
-            (
-                Axis("token", tokens, heads * head),
-                Axis("head", total_heads, head, Contiguous(tuple(split), heads)),
-                Axis("byte", head, 1),
-            ),
-            dtype=dtype,
-        ),
-    )
-
-
-def sectioned(
-    section_bytes: Sequence[int],
-    ranks: int,
-    split: Sequence[str] = ("tp",),
-    *,
-    dtype: str | None = None,
-) -> tuple[Tensor, ...]:
-    """Consecutive sections of a buffer, each the local ``1 / ranks`` of its own tensor, split
-    contiguously by byte over the ``ranks`` ranks of ``split`` (Mamba2 conv state ``[x | B | C]``,
-    GDN ``[Q | K | V]``), of elements of type ``dtype``."""
-    out, offset = [], 0
-    for i, n in enumerate(section_bytes):
-        out.append(
-            Tensor(
-                (Axis("byte", n * ranks, 1, Contiguous(tuple(split), n)),),
-                offset=offset,
-                name=f"s{i}",
-                dtype=dtype,
+    def check(self, size: int) -> None:
+        if sum(self.section_bytes) != size:
+            raise ValueError(
+                f"sections of {list(self.section_bytes)} bytes do not cover its {size} bytes"
             )
+
+    def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
+        out, base, offset = [], 0, 0
+        for n in self.section_bytes:
+            out.append(Piece(base + rank * n, offset, n))
+            base += ranks * n
+            offset += n
+        return tuple(out)
+
+    def space(self, size: int, ranks: int) -> tuple:
+        return ("sectioned", tuple(ranks * n for n in self.section_bytes))
+
+
+@dataclass(frozen=True)
+class ByHead(RoleLayout):
+    """Split by head over the ranks of ``split``, head-major or, with ``token_major``,
+    token-major.
+
+    The space holds the heads of all ranks: ``[head][byte]`` head-major (HND), a head's bytes
+    those of a page of it, and ``[token][head][byte]`` token-major (NHD). Place ``r`` of ``n``
+    ranks holds the ``size // head_bytes`` heads from ``r * total // n``: 8 heads of 256 bytes
+    over TP2, rank 1 holds heads 4..7, bytes 1024..2047 of the space; 6 heads over TP4, two per
+    rank, ranks hold heads 0..1, 1..2, 3..4 and 4..5, overlapping where the heads they hold
+    exceed the total.
+
+    In a manager's spec, an attention buffer's heads are by default the layer's KV heads: K of a
+    layer of 8 KV heads on TP2 holds 4 heads of ``size // 4`` bytes. A buffer of heads of its own
+    states their bytes (``head_bytes``), and for attention their total over all ranks
+    (``total``); recurrent state's total is its heads on this rank times the ranks. A buffer
+    whose heads are unknown, or whose size they do not divide, is this rank's own share
+    (``Own``).
+
+    Attributes:
+        token_major: Tokens outermost ([token, head, ...], NHD) rather than heads (HND).
+        head_bytes: Positive bytes of one head of a page; None in a spec, for the layer's KV heads.
+        total: Positive heads over the ranks of the split; None in a spec, for the layer's KV
+            heads or for recurrent state.
+        tokens: Positive token positions of a page of a token-major layout; resolved from the
+            buffer.
+        split: Parallel dimensions from ``GRID_DIMENSIONS``, outer to inner; the tensor-parallel
+            ranks by default, those of the buffer's layer group once resolved. Normalized to a
+            tuple.
+        dtype: The type of the elements by name, or None.
+
+    Raises:
+        ValueError: If a count is not a positive integer, or split is empty or names a dimension
+            twice or one outside ``GRID_DIMENSIONS``.
+    """
+
+    name: ClassVar[str] = "by_head"
+    token_major: bool = False
+    head_bytes: int | None = None
+    total: int | None = None
+    tokens: int | None = None
+    split: tuple[str, ...] = ("tp",)
+    dtype: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "token_major", bool(self.token_major))
+        for name in ("head_bytes", "total", "tokens"):
+            if getattr(self, name) is not None:
+                object.__setattr__(self, name, _integer(getattr(self, name), name, 1))
+        object.__setattr__(self, "split", _split(self.split, "a head split"))
+        _dtype(self)
+
+    def resolve(self, site: BufferSite) -> RoleLayout:
+        head_bytes, total = self.head_bytes, self.total
+        if head_bytes is None and not site.state:
+            kv_heads, kv_total = site.kv_heads
+            if kv_heads > 0 and site.size % kv_heads == 0:
+                head_bytes, total = site.size // kv_heads, kv_total
+        elif head_bytes is not None and not site.state and total is None:
+            raise ValueError(
+                f"heads of {head_bytes} bytes are an attention buffer's own; state how many lie "
+                "over all tensor ranks (total)"
+            )
+        if head_bytes is None or site.size % head_bytes:
+            return Own(site.split)
+        return dataclasses.replace(
+            self,
+            head_bytes=head_bytes,
+            total=total or site.size // head_bytes * site.ranks,
+            tokens=site.tokens if self.token_major else None,
+            split=site.split,
         )
-        offset += n
-    return tuple(out)
+
+    def check(self, size: int) -> None:
+        if self.head_bytes is None or self.total is None:
+            raise ValueError("a head split states its head bytes and total (resolve)")
+        if size % self.head_bytes:
+            raise ValueError(
+                f"{size} bytes is not a whole number of heads of {self.head_bytes} bytes"
+            )
+        if size // self.head_bytes > self.total:
+            raise ValueError(f"{size // self.head_bytes} heads held of {self.total}")
+        if self.token_major and (self.tokens is None or self.head_bytes % self.tokens):
+            raise ValueError(
+                f"heads of {self.head_bytes} bytes are not a whole number of rows of "
+                f"{self.tokens} tokens"
+            )
+
+    def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
+        heads = size // self.head_bytes
+        first = rank * self.total // ranks
+        if first + heads > self.total:
+            raise ValueError(
+                f"rank {rank} of {ranks} holds {heads} heads from head {first}, past the "
+                f"{self.total} heads"
+            )
+        if not self.token_major:
+            return (Piece(first * self.head_bytes, 0, size),)
+        if heads == self.total:
+            return (Piece(0, 0, size),)
+        row = self.head_bytes // self.tokens
+        return tuple(
+            Piece((t * self.total + first) * row, t * heads * row, heads * row)
+            for t in range(self.tokens)
+        )
+
+    def space(self, size: int, ranks: int) -> tuple:
+        if self.token_major:
+            return ("token_major", self.tokens, self.total, self.head_bytes // self.tokens)
+        return ("head_major", self.total, self.head_bytes)
+
+    def even(self, ranks: int) -> bool:
+        return self.total % ranks == 0 or ranks % self.total == 0
+
+
+def check_pieces(layout: RoleLayout, size: int, ranks: int, rank: int) -> None:
+    """Check that the pieces a ``size``-byte buffer laid out by ``layout`` holds at place ``rank``
+    of ``ranks`` lie back to back over it (over one position's bytes for a positional layout),
+    holding no byte of the space twice: bytes no piece describes would never move, or be moved
+    twice.
+
+    Raises:
+        ValueError: Naming what does not fit.
+    """
+    extent = layout.stride(size) if layout.positional else size
+    pieces = layout.pieces(size, ranks, rank)
+    held = sum(p.size for p in pieces)
+    if held != extent:
+        raise ValueError(
+            f"its pieces hold {held} bytes on this rank, not the {extent} bytes of its slot"
+        )
+    end = 0
+    for p in sorted(pieces, key=lambda p: p.offset):
+        if p.size <= 0 or p.offset != end:
+            raise ValueError(f"its pieces do not lie back to back over its {extent} bytes")
+        end += p.size
+    spans = sorted((p.at, p.at + p.size) for p in pieces)
+    if spans[0][0] < 0 or any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
+        raise ValueError("its pieces hold a byte of the space twice, or one before its start")
 
 
 @dataclass(frozen=True)
@@ -702,8 +632,8 @@ class LayerGroupDesc:
     A block held only by the kept window may remain unwritten without preventing
     resumption when it lies outside the read window.
 
-    Each buffer's ``tensors`` say how it splits over the ranks; ``shard`` is the share
-    of the group's content this rank holds, by the indices its transferred buffers
+    Each buffer's ``layout`` says how it splits over the ranks; ``shard`` is the share
+    of the group's content this rank holds, by the bytes its transferred buffers
     hold (``content_shard``), so ranks with equal shares hold equal bytes.
 
     Attributes:
@@ -808,8 +738,8 @@ class BufferDesc:
         pool_index: Non-negative pool index within pool_group.
         slot_offset: Non-negative byte offset within that pool's slot.
         size: Positive byte size of the buffer.
-        tensors: The tensors whose local pieces the buffer holds, and how they spread over ranks;
-            normalized to a tuple. Defaults to the whole buffer, alike on every rank.
+        layout: How the role's bytes spread over ranks (``RoleLayout``); the whole buffer alike on
+            every rank by default.
         transferred: Whether peers transfer this role. False marks local-only buffers, which still
             accompany copies of whole slots.
         expansion: Positive number of sub-pages within one page, each of
@@ -818,10 +748,9 @@ class BufferDesc:
 
     Raises:
         ValueError: If an index is not a non-negative integer, size or expansion is not a positive
-            integer, any such value is a boolean, two tensors share a name, a tensor's piece
-            reaches past size, the pieces of several tensors do not lie back to back over the
-            whole buffer, or an axis of token positions shares its buffer with another tensor or
-            with sub-pages."""
+            integer, any such value is a boolean, layout is no ``RoleLayout`` or does not fit the
+            buffer (``RoleLayout.check``), or a layout of token positions lies in a page of
+            sub-pages."""
 
     layer: int
     role: str
@@ -829,7 +758,7 @@ class BufferDesc:
     pool_index: int
     slot_offset: int
     size: int
-    tensors: tuple[Tensor, ...] = ()
+    layout: RoleLayout = Replicated()
     transferred: bool = True
     expansion: int = 1
 
@@ -839,44 +768,30 @@ class BufferDesc:
         object.__setattr__(self, "size", _integer(self.size, "size", 1))
         object.__setattr__(self, "expansion", _integer(self.expansion, "expansion", 1))
         object.__setattr__(self, "role", str(self.role))
-        tensors = tuple(self.tensors) or replicated(self.size)
-        if not all(isinstance(t, Tensor) for t in tensors):
-            raise ValueError(f"tensors must be Tensor values, got {tensors!r}")
-        names = [t.name for t in tensors]
-        if len(set(names)) != len(names):
-            raise ValueError(f"buffer ({self.layer}, {self.role}): tensor names repeat: {names}")
-        ends = [_footprint(t) for t in tensors]
-        for t, end in zip(tensors, ends):
-            if end is not None and end > self.size:
-                raise ValueError(
-                    f"buffer ({self.layer}, {self.role}): tensor {t.name!r} reaches byte {end} of "
-                    f"a {self.size}-byte buffer"
-                )
-        if len(tensors) > 1 and None not in ends:
-            pieces = sorted((t.offset, end) for t, end in zip(tensors, ends))
-            bounds = [0, *(b for piece in pieces for b in piece), self.size]
-            if any(a != b for a, b in zip(bounds[::2], bounds[1::2])):
-                raise ValueError(
-                    f"buffer ({self.layer}, {self.role}): sections {pieces} do not cover its "
-                    f"{self.size} bytes"
-                )
-        if any(t.positional for t in tensors) and (len(tensors) > 1 or self.expansion != 1):
+        if not isinstance(self.layout, RoleLayout):
             raise ValueError(
-                f"buffer ({self.layer}, {self.role}): an axis of token positions lies in the "
-                f"buffer's only tensor, in a page without sub-pages ({len(tensors)} tensors, "
-                f"expansion {self.expansion})"
+                f"buffer ({self.layer}, {self.role}): layout must be a RoleLayout, got "
+                f"{self.layout!r}"
             )
-        object.__setattr__(self, "tensors", tensors)
+        try:
+            self.layout.check(self.size)
+        except ValueError as error:
+            raise ValueError(f"buffer ({self.layer}, {self.role}): {error}") from error
+        if self.layout.positional and self.expansion != 1:
+            raise ValueError(
+                f"buffer ({self.layer}, {self.role}): a layout of token positions in a page of "
+                f"{self.expansion} sub-pages"
+            )
 
     @property
     def split(self) -> bool:
-        """Whether some tensor spreads over parallel dimensions; else every rank holds it alike."""
-        return any(t.split for t in self.tensors)
+        """Whether its layout spreads over parallel dimensions; else every rank holds it alike."""
+        return bool(self.layout.split)
 
     @property
-    def positional(self) -> Axis | None:
-        """The buffer's axis of token positions (``AxisKind.positional``), or None."""
-        return next((t.positional for t in self.tensors if t.positional is not None), None)
+    def positional(self) -> bool:
+        """Whether it holds token positions (``RoleLayout.positional``)."""
+        return self.layout.positional
 
     @classmethod
     def unchecked(
@@ -887,7 +802,7 @@ class BufferDesc:
         pool_index: int,
         slot_offset: int,
         size: int,
-        tensors: tuple[Tensor, ...] = (),
+        layout: RoleLayout = Replicated(),
         transferred: bool = True,
         expansion: int = 1,
     ) -> BufferDesc:
@@ -901,7 +816,7 @@ class BufferDesc:
             pool_index=pool_index,
             slot_offset=slot_offset,
             size=size,
-            tensors=tuple(tensors) or replicated(size),
+            layout=layout,
             transferred=transferred,
             expansion=expansion,
         )
@@ -1021,8 +936,9 @@ class PageLayout:
     Raises:
         ValueError: If tokens_per_page, a slot width or a KV head count is not a positive integer; a
             group, pool, layer or region index is not a non-negative integer; any such value is a
-            boolean; a buffer's expansion does not divide tokens_per_page; or quant_mode is not
-            listed above."""
+            boolean; a buffer's expansion does not divide tokens_per_page, or its pieces on this
+            rank do not lie back to back over it (``check_pieces``); or quant_mode is not listed
+            above."""
 
     tokens_per_page: int
     pool_slot_bytes: Mapping[int, tuple[int, ...]]
@@ -1077,6 +993,11 @@ class PageLayout:
                     f"buffer ({buffer.layer}, {buffer.role}): expansion {buffer.expansion} does not "
                     f"divide {self.tokens_per_page} tokens per page"
                 )
+            place = grid_place(self.topology, buffer.layout.split)
+            try:
+                check_pieces(buffer.layout, buffer.size, *place)
+            except ValueError as error:
+                raise ValueError(f"buffer ({buffer.layer}, {buffer.role}): {error}") from error
 
     @classmethod
     def unchecked(
@@ -1141,24 +1062,35 @@ def _same_group(layout: PageLayout, desc: LayerGroupDesc) -> LayerGroupDesc | No
     return None
 
 
+def _coverage(buffer: BufferDesc, topology: RankTopology) -> tuple[tuple[int, int], ...]:
+    """The bytes of its space the buffer holds on the rank at ``topology``, as ``(start, end)``
+    spans in order, adjacent ones merged."""
+    ranks, rank = grid_place(topology, buffer.layout.split)
+    spans: list[list[int]] = []
+    for start, end in sorted(
+        (p.at, p.at + p.size) for p in buffer.layout.pieces(buffer.size, ranks, rank)
+    ):
+        if spans and spans[-1][1] == start:
+            spans[-1][1] = end
+        else:
+            spans.append([start, end])
+    return tuple((start, end) for start, end in spans)
+
+
 def _split_holdings(buffers: Sequence[BufferDesc], topology: RankTopology) -> tuple:
-    """The indices the rank at ``topology`` holds of every split axis of the transferred buffers
-    among ``buffers``, as ((layer, role, tensor, axis), progression) pairs in that key order."""
-    out = []
-    for buffer in buffers:
-        if not buffer.transferred or not buffer.split:
-            continue
-        for tensor in buffer.tensors:
-            for axis in tensor.axes:
-                if axis.split:
-                    key = (buffer.layer, buffer.role, tensor.name, axis.name)
-                    out.append((key, held(axis, topology)))
+    """The bytes the rank at ``topology`` holds of the transferred buffers among ``buffers`` that
+    split over ranks, as ((layer, role), spans) pairs in that key order."""
+    out = [
+        ((buffer.layer, buffer.role), _coverage(buffer, topology))
+        for buffer in buffers
+        if buffer.transferred and buffer.split
+    ]
     return tuple(sorted(out, key=lambda item: item[0]))
 
 
 def _held_indices(layout: PageLayout, desc: LayerGroupDesc) -> tuple | None:
-    """The indices this rank holds of every split axis of the group's transferred buffers, by
-    (layer, role, tensor, axis); None when no transferred buffer splits."""
+    """The bytes this rank holds of the group's transferred buffers that split, by (layer, role);
+    None when no transferred buffer splits."""
     buffers = [
         b for b in layout.buffers if b.pool_group == desc.pool_group and b.layer in desc.layers
     ]
@@ -1167,27 +1099,24 @@ def _held_indices(layout: PageLayout, desc: LayerGroupDesc) -> tuple | None:
 
 def content_shard(buffers: Sequence[BufferDesc], topology: RankTopology) -> ShardDesc:
     """The share of a layer group's content the rank at ``topology`` holds, read from the group's
-    ``buffers``: ranks of its grid hold the same share exactly when they hold the same indices of
-    every split axis of the transferred buffers, and shares are numbered in the order of the
-    indices they hold. The whole content when every rank holds alike.
+    ``buffers``: ranks of its grid hold the same share exactly when they hold the same bytes of
+    every transferred buffer that splits, and shares are numbered in the order of the bytes they
+    hold. The whole content when every rank holds alike.
 
-    The numbering names the same indices under every rank count that divides, or is divided by,
-    each split axis's extent, as attention heads and TP sizes do. Where an axis's extent and rank
-    count do not divide one another, each rank of the dimensions the group splits over is a share
-    of its own, so that no other rank count can name other indices alike."""
+    The numbering names the same bytes under every rank count that divides, or is divided by,
+    each layout's split (``RoleLayout.even``), as attention heads and TP sizes do. Where one does
+    not, each rank of the dimensions the group splits over is a share of its own, so that no other
+    rank count can name other bytes alike."""
 
     def share(place: RankTopology) -> tuple:
-        return tuple(
-            (key, (p.start, p.step, p.count)) for key, p in _split_holdings(buffers, place)
-        )
+        return _split_holdings(buffers, place)
 
     mine = share(topology)
     if not mine:
         return ShardDesc()
-    axes = [a for b in buffers if b.transferred for t in b.tensors for a in t.axes if a.split]
-    counts = [grid_place(topology, a.split)[0] for a in axes]
-    if any(a.extent % n and n % a.extent for a, n in zip(axes, counts)):
-        dims = [dim for dim in GRID_DIMENSIONS if any(dim in a.split for a in axes)]
+    split = [b for b in buffers if b.transferred and b.split]
+    if any(not b.layout.even(grid_place(topology, b.layout.split)[0]) for b in split):
+        dims = [dim for dim in GRID_DIMENSIONS if any(dim in b.layout.split for b in split)]
         size, rank = grid_place(topology, dims)
         return ShardDesc(size, rank) if size > 1 else ShardDesc()
     shares = {
@@ -1207,12 +1136,6 @@ def content_shard(buffers: Sequence[BufferDesc], topology: RankTopology) -> Shar
     return ShardDesc(len(shares), sorted(shares).index(mine))
 
 
-def held_bytes(tensor: Tensor, topology: RankTopology) -> int:
-    """Bytes of the tensor's local piece on the rank at ``topology``: one per index it holds of
-    every axis together."""
-    return math.prod(held(axis, topology).count for axis in tensor.axes)
-
-
 def replica_ranks(
     ranks: Sequence[PageLayout],
     rank: int,
@@ -1228,8 +1151,8 @@ def replica_ranks(
     by context-parallel rank, while a state group's rows do not); hold the same layers, in a layer
     group of the same kind; and hold the same share of the group's content: a buffer every rank
     holds alike is the same on every such rank, and split buffers match when the ranks hold the
-    same indices of every split axis. Without split buffers, the published content shard is the
-    only basis for matching.
+    same bytes of their spaces. Without split buffers, the published content shard is the only
+    basis for matching.
 
     Args:
         ranks: Every rank's layout of one instance, by flat rank.
@@ -1270,28 +1193,6 @@ def replica_ranks(
     return tuple(out)
 
 
-def axis_to_dict(axis: Axis) -> dict:
-    """``axis`` as plain values for a peer, which ``axis_from_dict`` reads back."""
-    return {
-        "name": axis.name,
-        "extent": axis.extent,
-        "stride": axis.stride,
-        "kind": axis.kind.to_dict(),
-    }
-
-
-def axis_from_dict(data: Mapping) -> Axis:
-    """The axis ``axis_to_dict`` wrote, checked as the constructors check it."""
-    return Axis(data["name"], data["extent"], data["stride"], axis_kind_from_dict(data["kind"]))
-
-
-def axis_document(axis: Axis) -> dict:
-    """What ``layout_id`` hashes of ``axis``: its name, extent and stride, and its kind's
-    ``AxisKind.document``, which leaves out what a kind's defaults say, so that a kind or field
-    added later leaves the document of every axis not using it unchanged."""
-    return {"name": axis.name, "extent": axis.extent, "stride": axis.stride, **axis.kind.document()}
-
-
 def layout_to_dict(layout: PageLayout) -> dict:
     """``layout`` as plain values (dicts, lists, ints, strings) for a peer, which
     ``layout_from_dict`` reads back; the lender's region maps stay local and are left out."""
@@ -1319,15 +1220,7 @@ def layout_to_dict(layout: PageLayout) -> dict:
                 "pool_index": b.pool_index,
                 "slot_offset": b.slot_offset,
                 "size": b.size,
-                "tensors": [
-                    {
-                        "axes": [axis_to_dict(a) for a in t.axes],
-                        "offset": t.offset,
-                        "name": t.name,
-                        "dtype": t.dtype,
-                    }
-                    for t in b.tensors
-                ],
+                "layout": b.layout.to_dict(),
                 "transferred": b.transferred,
                 "expansion": b.expansion,
             }
@@ -1368,15 +1261,7 @@ def layout_from_dict(data: Mapping) -> PageLayout:
                 pool_index=b["pool_index"],
                 slot_offset=b["slot_offset"],
                 size=b["size"],
-                tensors=tuple(
-                    Tensor(
-                        tuple(axis_from_dict(a) for a in t["axes"]),
-                        t["offset"],
-                        t["name"],
-                        t.get("dtype"),
-                    )
-                    for t in b["tensors"]
-                ),
+                layout=role_layout_from_dict(b["layout"]),
                 transferred=b["transferred"],
                 expansion=b["expansion"],
             )

@@ -26,15 +26,7 @@ from typing import TYPE_CHECKING, Mapping, Sequence
 
 import numpy as np
 
-from ..page_layout import (
-    BufferDesc,
-    LayerGroupDesc,
-    Paged,
-    PageLayout,
-    Tensor,
-    axis_document,
-    replicated,
-)
+from ..page_layout import BufferDesc, LayerGroupDesc, Paged, PageLayout, Replicated
 from ..page_table import DevicePool, ManagerLayout  # noqa: F401  DevicePool: the lender's pools
 
 if TYPE_CHECKING:
@@ -42,7 +34,7 @@ if TYPE_CHECKING:
 
 # A new field left out at its default keeps the version; changing the encoding or the meaning of
 # an existing field bumps it.
-LAYOUT_ID_VERSION = 5
+LAYOUT_ID_VERSION = 6
 
 
 # Enums encode as the member name, floats as "f64:" plus the 16 hex digits of their big-endian
@@ -109,22 +101,19 @@ def _set_fields(value: object, hashed: Mapping[str, str]) -> dict:
 
 # Fields layout_id leaves out by design (see layout_document), or hashes in their own way.
 _UNHASHED: dict[type, frozenset[str]] = {
-    Tensor: frozenset({"dtype"}),
-    BufferDesc: frozenset({"tensors"}),
+    BufferDesc: frozenset({"layout"}),
     LayerGroupDesc: frozenset(
         {"kept_window", "num_sink_blocks", "pool_group", "shard", "read_window", "model_layers"}
     ),
 }
 
 
-def _tensors_document(buffer: BufferDesc) -> list[dict] | None:
-    """The buffer's tensors, or None for the whole buffer alike on every rank."""
-    if buffer.tensors == replicated(buffer.size):
+def _layout_document(buffer: BufferDesc) -> dict | None:
+    """The buffer's layout (``RoleLayout.document``), or None for the whole buffer alike on every
+    rank."""
+    if buffer.layout == Replicated():
         return None
-    return [
-        {"axes": [axis_document(axis) for axis in tensor.axes], **_set_fields(tensor, {})}
-        for tensor in buffer.tensors
-    ]
+    return buffer.layout.document()
 
 
 def _buffer_document(layout: PageLayout, b: BufferDesc) -> dict:
@@ -142,16 +131,16 @@ def _buffer_document(layout: PageLayout, b: BufferDesc) -> dict:
         "size": int(b.size),
         **_set_fields(b, {"transferred": "transfer"}),
     }
-    tensors = _tensors_document(b)
-    if tensors is not None:
-        doc["tensors"] = tensors
+    layout = _layout_document(b)
+    if layout is not None:
+        doc["layout"] = layout
     return doc
 
 
 def layout_document(layout: PageLayout) -> dict:
     """Hash canonical global layer groups, each group's model layers (aligned with its sorted
     global layers) when any differs from its global layer, slot widths, kinds and each buffer's
-    tensors, but no addresses, windows, sinks, shards, topology, total head counts, dtypes or
+    layout, but no addresses, windows, sinks, shards, topology, total head counts, dtypes or
     local region numbering. Two pipeline stages naming their layers alike but holding other model
     layers differ. A field a layout type gains is hashed where it is set (``_set_fields``)."""
     canonical = canonical_order([desc.layers for desc in layout.layer_groups])

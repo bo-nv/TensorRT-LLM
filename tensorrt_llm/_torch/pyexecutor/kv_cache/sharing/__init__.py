@@ -222,7 +222,7 @@ def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: Staging
             recurrent state under Helix; model sparse buffers (``is_sparse``), whose pages can live
             in host memory; a non-REQUIRED attention group without a window; inconsistent groups,
             configs or declarations, such as a buffer role the manager does not declare or
-            tensors whose pieces do not add up to a buffer's size
+            a layout whose pieces do not add up to a buffer's size
             (``KVCacheManagerV2.get_page_table``);
             no pages to stage; ``max_bytes`` below one local fetch; a malformed region, or two of
             one memory kind that overlap; or scope over 65535 bytes. Unmarked sparse-attention

@@ -45,12 +45,12 @@ except ImportError:  # pragma: no cover - CPU-only env without CUDA bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import map_buffers, sent_bytes
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
+    ByHead,
     LayerGroupDesc,
     PageLayout,
     RankTopology,
+    Sectioned,
     grid_place,
-    head_major,
-    sectioned,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ManagerLayout
 
@@ -617,10 +617,18 @@ def _k3_page_table(kda: bool = True) -> ManagerLayout:
         conv = _K3_CONV_SLOT_BYTES
         ssm = _K3_SSM_SLOT_BYTES
         buffers.append(
-            BufferDesc(layer, "conv_state", 1, 0, i * conv, conv, sectioned([conv // 3] * 3, 1))
+            BufferDesc(layer, "conv_state", 1, 0, i * conv, conv, Sectioned((conv // 3,) * 3))
         )
         buffers.append(
-            BufferDesc(layer, "ssm_state", 1, 1, i * ssm, ssm, head_major(ssm, 4, 4, ("tp", "cp")))
+            BufferDesc(
+                layer,
+                "ssm_state",
+                1,
+                1,
+                i * ssm,
+                ssm,
+                ByHead(head_bytes=ssm // 4, total=4, split=("tp", "cp")),
+            )
         )
     groups = [LayerGroupDesc("attention", None, 0, 0, tuple(attention))]
     widths = {0: (_K3_MLA_BLOCK_BYTES,)}
@@ -708,7 +716,15 @@ class TestMambaHelixCP:
             pool_slot_bytes={0: (size,)},
             layer_groups=(LayerGroupDesc("state", None, 0, 0, (0,)),),
             buffers=(
-                BufferDesc(0, "ssm_state", 0, 0, 0, size, head_major(size, heads, 8, ("tp", "cp"))),
+                BufferDesc(
+                    0,
+                    "ssm_state",
+                    0,
+                    0,
+                    0,
+                    size,
+                    ByHead(head_bytes=64, total=8, split=("tp", "cp")),
+                ),
             ),
             topology=topology,
         )

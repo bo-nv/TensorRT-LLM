@@ -37,7 +37,7 @@ from tensorrt_llm import Mapping
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3KVCacheManagerV2
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import head_major, replicated, token_major
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import ByHead, Replicated
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import BufferSite
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
@@ -87,7 +87,7 @@ def test_minimax_cache_indices_support_block_count_limit() -> None:
 
 
 def _laid_out(manager: KVCacheManagerV2, role: str, size: int):
-    """The tensors the manager's page table spec lays out for a ``size``-byte ``role`` buffer.
+    """The layout the manager's page table spec gives a ``size``-byte ``role`` buffer.
 
     The buffer is of an attention layer of 4 KV heads, on rank 0 of TP2, which holds 2 of them.
     """
@@ -101,7 +101,7 @@ def _laid_out(manager: KVCacheManagerV2, role: str, size: int):
         split=("tp",),
         ranks=2,
     )
-    return manager.page_table_spec().layout_of(role).tensors(site)
+    return manager.page_table_spec().layout_of(role).resolve(site)
 
 
 @pytest.mark.cpu_only
@@ -110,7 +110,7 @@ def test_v2_page_table_spec_defaults() -> None:
 
     # K/V split by head, head-major; the index-key side cache spreads as its manager lays it out
     # (MiniMax M3 below), so the base lays out none.
-    assert _laid_out(manager, Role.KEY, 256) == head_major(256, 2, 4)
+    assert _laid_out(manager, Role.KEY, 256) == ByHead(head_bytes=128, total=4)
     assert manager.page_table_spec().layout_of(Role.INDEX_KEY) is None
 
 
@@ -150,10 +150,12 @@ def test_minimax_page_table_spec(
 
     assert manager._main_kv_layout_name() == expected_main_layout
     expected_kv = (
-        token_major(256, 16, 2, 4) if expected_main_layout == "NHD" else head_major(256, 2, 4)
+        ByHead(True, 128, 4, 16)
+        if expected_main_layout == "NHD"
+        else ByHead(head_bytes=128, total=4)
     )
     assert _laid_out(manager, Role.KEY, 256) == expected_kv
-    assert _laid_out(manager, Role.INDEX_KEY, 128) == replicated(128)
+    assert _laid_out(manager, Role.INDEX_KEY, 128) == Replicated()
     if implementation == "triton":
         fp8_manager = MiniMaxM3KVCacheManagerV2(
             num_layers=0,
@@ -164,7 +166,7 @@ def test_minimax_page_table_spec(
                 implementation="triton", indexer_kv_dtype="bf16"
             ),
         )
-        assert _laid_out(fp8_manager, Role.KEY, 256) == token_major(256, 16, 2, 4)
+        assert _laid_out(fp8_manager, Role.KEY, 256) == ByHead(True, 128, 4, 16)
         assert fp8_manager._dense_native_layer_ids == ()
 
 
